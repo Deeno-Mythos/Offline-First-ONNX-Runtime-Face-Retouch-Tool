@@ -1,0 +1,8 @@
+/target/
+/output/
+/models/*.onnx
+/models/*.dll
+/models/*.so*
+/models/*.dylib
+/astra.log
+
