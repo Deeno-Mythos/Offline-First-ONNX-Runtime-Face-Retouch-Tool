@@ -1,8 +1,17 @@
 /target/
 /output/
 /models/*.onnx
+/models/burn/*.bpk
 /models/*.dll
 /models/*.so*
 /models/*.dylib
 /astra.log
 
+/.ai-tools/
+/models/*.pt
+/models/*.pth
+/models/*.zip
+/models/*.nupkg
+/models/cpu/
+/models/directml/
+/.astra-cache/

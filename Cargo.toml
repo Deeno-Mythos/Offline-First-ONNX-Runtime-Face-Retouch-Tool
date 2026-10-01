@@ -2,13 +2,13 @@
 name = "astra-retouch"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 description = "A natural, non-destructive portrait retouching studio"
 license = "MIT"
 
 [features]
-default = []
-onnx = ["dep:ort", "dep:ndarray"]
+default = ["onnx"]
+onnx = ["dep:ort", "dep:ndarray", "dep:burn", "dep:burn-store", "dep:burn-onnx"]
 
 [dependencies]
 eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
@@ -27,6 +27,11 @@ half = { version = "2", features = ["bytemuck"] }
 moxcms = "0.8"
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["std", "ndarray", "load-dynamic", "directml", "cuda", "coreml", "api-24"] }
 ndarray = { version = "0.17", optional = true }
+burn = { version = "=0.22.0-pre.4", default-features = false, features = ["std", "cpu", "store"], optional = true }
+burn-store = { version = "=0.22.0-pre.4", default-features = false, features = ["std"], optional = true }
+
+[build-dependencies]
+burn-onnx = { version = "=0.22.0-pre.4", default-features = false, features = ["import"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,4 +1,4 @@
-struct Uniforms { split: f32, srgb_target: f32, reserved: vec2<f32> }
+struct Uniforms { split: f32, srgb_target: f32, reserved: vec2<f32>, uv_rect: vec4<f32> }
 @group(0) @binding(0) var original: texture_2d<f32>;
 @group(0) @binding(1) var edited: texture_2d<f32>;
 @group(0) @binding(2) var sampler_linear: sampler;
@@ -16,9 +16,10 @@ fn decode_srgb(v: vec3<f32>) -> vec3<f32> {
     return select(pow((v + 0.055) / 1.055, vec3(2.4)), v / 12.92, v <= vec3(0.04045));
 }
 @fragment fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
-    let before = textureSample(original, sampler_linear, v.uv);
-    let after = textureSample(edited, sampler_linear, v.uv);
-    let pixel = select(after, before, v.uv.x < uniforms.split);
+    let uv = uniforms.uv_rect.xy + v.uv * uniforms.uv_rect.zw;
+    let before = textureSample(original, sampler_linear, uv);
+    let after = textureSample(edited, sampler_linear, uv);
+    let pixel = select(after, before, uv.x < uniforms.split);
     let checker = 0.12 + f32((u32(v.position.x / 12.) + u32(v.position.y / 12.)) % 2u) * 0.035;
     let display = encode_srgb(pixel.rgb) * pixel.a + vec3(checker) * (1. - pixel.a);
     return vec4(select(display, decode_srgb(display), uniforms.srgb_target > 0.5), 1.);
