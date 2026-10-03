@@ -1,4 +1,6 @@
 mod ai_cache;
+pub mod assets;
+pub mod branding;
 #[cfg(all(feature = "onnx", astra_burn_models))]
 mod burn_inference;
 pub mod cleanup;
@@ -8,8 +10,16 @@ pub mod flyaway;
 pub mod geometry;
 pub mod gpu;
 pub mod interaction;
+pub mod layer_mask;
+pub mod layer_stack;
+pub mod layers;
 pub mod model;
+pub mod nullstate;
+mod pixel_changes;
+mod preferences;
 mod session;
 pub mod shared;
+mod shortcuts;
+mod stack_render;
 pub mod ui;
 mod worker;

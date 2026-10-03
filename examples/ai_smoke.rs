@@ -1,5 +1,5 @@
 use anyhow::Result;
-use astra_retouch::{
+use hastur_retouch::{
     engine::{self, Adjustment, Edit},
     model::{self, Provider},
 };
@@ -120,20 +120,24 @@ fn main() -> Result<()> {
     let mut export_edit = edit.clone();
     export_edit.settings.eye_size = 45.0;
     export_edit.settings.nose_width = -30.0;
-    export_edit.warps.push(astra_retouch::geometry::WarpStroke {
-        center: [0.18, 0.72],
-        delta: [0.008, 0.0],
-        radius: 0.08,
-        softness: 0.7,
-        strength: 100.0,
-    });
-    export_edit.clones.push(astra_retouch::cleanup::CloneStamp {
-        center: [0.56, 0.82],
-        source: [0.48, 0.82],
-        radius: 0.015,
-        softness: 0.7,
-        strength: 100.0,
-    });
+    export_edit
+        .warps
+        .push(hastur_retouch::geometry::WarpStroke {
+            center: [0.18, 0.72],
+            delta: [0.008, 0.0],
+            radius: 0.08,
+            softness: 0.7,
+            strength: 100.0,
+        });
+    export_edit
+        .clones
+        .push(hastur_retouch::cleanup::CloneStamp {
+            center: [0.56, 0.82],
+            source: [0.48, 0.82],
+            radius: 0.015,
+            softness: 0.7,
+            strength: 100.0,
+        });
     let path = engine::export_with_options(
         &full_photo,
         &export_edit,

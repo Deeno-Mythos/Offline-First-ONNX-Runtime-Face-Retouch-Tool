@@ -16,6 +16,7 @@ const MODELS: &[&str] = &[
     "local_detection.onnx",
     "local_inpainting.onnx",
 ];
+// File-format identifiers and the hash seed intentionally stay stable across the rename.
 const SIGNATURE: &[u8; 8] = b"ASTRAAI2";
 const COMPACT_SIGNATURE: &[u8; 8] = b"ASTRAAI3";
 struct MemoryEntry {
@@ -40,6 +41,24 @@ fn memory() -> &'static std::sync::Mutex<std::collections::VecDeque<MemoryEntry>
     static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<MemoryEntry>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(Default::default)
+}
+/// Forget retained maps/source buffers without deleting reusable disk results.
+pub(crate) fn release_source(image: &std::sync::Arc<RgbaImage>) -> Vec<PathBuf> {
+    let Ok(mut cache) = memory().lock() else {
+        return vec![];
+    };
+    let mut paths = Vec::new();
+    cache.retain(|entry| {
+        let remove = entry
+            .source
+            .as_ref()
+            .is_some_and(|source| std::sync::Arc::ptr_eq(source, image));
+        if remove {
+            paths.push(entry.path.clone());
+        }
+        !remove
+    });
+    paths
 }
 fn remember(path: PathBuf, seg: &Segmentation, provider: crate::model::Provider) {
     let Ok(meta) = fs::metadata(&path) else {
@@ -70,7 +89,7 @@ fn remember(path: PathBuf, seg: &Segmentation, provider: crate::model::Provider)
         cache.pop_front();
     }
 }
-fn path(image: &RgbaImage, provider: crate::model::Provider) -> Option<PathBuf> {
+fn paths(image: &RgbaImage, provider: crate::model::Provider) -> Option<[PathBuf; 2]> {
     let mut hash = 0xcbf29ce484222325u64;
     let mut update = |data: &[u8]| {
         for b in data {
@@ -98,17 +117,32 @@ fn path(image: &RgbaImage, provider: crate::model::Provider) -> Option<PathBuf> 
                 .to_le_bytes(),
         );
     }
-    Some(
-        model::model_path(MODELS[0])
-            .parent()?
-            .parent()?
-            .join(".astra-cache")
-            .join(format!("{hash:016x}.bin")),
-    )
+    let model = model::model_path(MODELS[0]);
+    let root = model.parent()?.parent()?;
+    let filename = format!("{hash:016x}.bin");
+    Some([
+        root.join(".hastur-cache").join(&filename),
+        root.join(".astra-cache").join(filename),
+    ])
 }
 pub fn load(image: &RgbaImage, provider: crate::model::Provider) -> Option<Segmentation> {
-    let path = path(image, provider)?;
-    let meta = fs::metadata(&path).ok()?;
+    load_paths(&paths(image, provider)?, image.dimensions(), provider)
+}
+fn load_paths(
+    paths: &[PathBuf],
+    dimensions: (u32, u32),
+    provider: crate::model::Provider,
+) -> Option<Segmentation> {
+    paths
+        .iter()
+        .find_map(|path| load_path(path, dimensions, provider))
+}
+fn load_path(
+    path: &Path,
+    dimensions: (u32, u32),
+    provider: crate::model::Provider,
+) -> Option<Segmentation> {
+    let meta = fs::metadata(path).ok()?;
     let stamp = (meta.len(), meta.modified().ok()?);
     if let Ok(mut cache) = memory().lock()
         && let Some(index) = cache
@@ -120,9 +154,9 @@ pub fn load(image: &RgbaImage, provider: crate::model::Provider) -> Option<Segme
         cache.push_back(entry);
         return Some(seg);
     }
-    let mut reader = BufReader::new(File::open(&path).ok()?);
-    let seg = read(&mut reader, image.dimensions()).ok()?;
-    remember(path, &seg, provider);
+    let mut reader = BufReader::new(File::open(path).ok()?);
+    let seg = read(&mut reader, dimensions).ok()?;
+    remember(path.to_path_buf(), &seg, provider);
     Some(seg)
 }
 pub(crate) fn associate(
@@ -163,8 +197,11 @@ pub(crate) fn load_shared(
         })
     {
         let entry = &cache[index];
-        let meta = fs::metadata(&entry.path).ok()?;
-        if (meta.len(), meta.modified().ok()?) == entry.stamp {
+        if let Ok(meta) = fs::metadata(&entry.path)
+            && meta
+                .modified()
+                .is_ok_and(|modified| (meta.len(), modified) == entry.stamp)
+        {
             let entry = cache.remove(index)?;
             let seg = entry.seg.clone();
             cache.push_back(entry);
@@ -276,6 +313,8 @@ fn read(reader: &mut impl Read, dims: (u32, u32)) -> Result<Segmentation> {
     let mut seg = Segmentation {
         width: w,
         height: h,
+        // Legacy cache writes followed the complete all-or-error portrait pipeline.
+        prepared: crate::nullstate::PortraitDemand::ALL,
         map_crop,
         faces,
         status: format!("Cached · {}", String::from_utf8(status)?),
@@ -352,7 +391,7 @@ fn write_values(writer: &mut impl Write, data: &[f32]) -> Result<()> {
     Ok(())
 }
 pub fn save(image: &RgbaImage, seg: &Segmentation, provider: crate::model::Provider) -> Result<()> {
-    let Some(path) = path(image, provider) else {
+    let Some([path, _]) = paths(image, provider) else {
         return Ok(());
     };
     let dir = path.parent().unwrap();
@@ -398,6 +437,69 @@ fn trim(dir: &Path, current: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_cache_is_a_read_only_fallback_and_new_valid_cache_takes_precedence() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = [
+            directory.path().join(".hastur-cache/fixture.bin"),
+            directory.path().join(".astra-cache/fixture.bin"),
+        ];
+        for path in &paths {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        let mut legacy = Segmentation {
+            width: 3,
+            height: 2,
+            skin: vec![0.25; 6].into(),
+            neural_blend: vec![[0.34, 0.51, 0.82]; 6].into(),
+            status: "Cached ONNX CPU ready".into(),
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        write(&mut bytes, &legacy).unwrap();
+        fs::write(&paths[1], &bytes).unwrap();
+        let loaded = load_paths(&paths, (3, 2), model::Provider::Cpu).unwrap();
+        assert_eq!(loaded.skin, legacy.skin);
+        assert!(!paths[0].exists());
+        assert!(
+            memory()
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path == paths[1] && entry.seg.skin.same_storage(&loaded.skin))
+        );
+        fs::write(&paths[0], "interrupted new cache write").unwrap();
+        assert_eq!(
+            load_paths(&paths, (3, 2), model::Provider::Cpu)
+                .unwrap()
+                .neural_blend,
+            legacy.neural_blend
+        );
+        legacy.width = 2;
+        legacy.height = 3;
+        let mut wrong_photo = Vec::new();
+        write(&mut wrong_photo, &legacy).unwrap();
+        fs::write(&paths[0], wrong_photo).unwrap();
+        assert_eq!(
+            load_paths(&paths, (3, 2), model::Provider::Cpu)
+                .unwrap()
+                .skin[0],
+            0.25
+        );
+        legacy.width = 3;
+        legacy.height = 2;
+        legacy.skin = vec![0.8; 6].into();
+        let mut replacement = Vec::new();
+        write(&mut replacement, &legacy).unwrap();
+        fs::write(&paths[0], replacement).unwrap();
+        assert_eq!(
+            load_paths(&paths, (3, 2), model::Provider::Cpu)
+                .unwrap()
+                .skin[0],
+            0.8
+        );
+        assert_eq!(fs::read(&paths[1]).unwrap(), bytes);
+    }
     #[test]
     fn cache_keeps_exact_neural_values_and_rejects_truncation_and_wrong_photos() {
         let seg = Segmentation {

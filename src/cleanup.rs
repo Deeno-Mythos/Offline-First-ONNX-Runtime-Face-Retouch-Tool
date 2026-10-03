@@ -25,13 +25,16 @@ pub struct PatchStroke {
 }
 
 /// Donor selection and boundary corrections are computed once per edit, independently of tiles.
+#[derive(Clone)]
 pub struct PreparedCleanup {
     operations: Vec<PreparedOperation>,
 }
+#[derive(Clone)]
 enum PreparedOperation {
     Stamp(PreparedStamp),
     Patch(PreparedPatch),
 }
+#[derive(Clone)]
 struct PreparedStamp {
     center: [f32; 2],
     radius: f32,
@@ -41,13 +44,99 @@ struct PreparedStamp {
     correction: [f32; 3],
     clip_source: bool,
 }
+#[derive(Clone)]
 struct PreparedPatch {
     boundary: Vec<[f32; 2]>,
     bounds: crate::engine::Crop,
     offset: [f32; 2],
-    correction: [f32; 3],
+    correction: PatchLighting,
     feather: f32,
     strength: f32,
+}
+
+/// A boundary-fitted lighting plane preserves the destination's local light
+/// gradient while transferring donor texture. Only a few coefficients are kept.
+#[derive(Clone, Copy, Default)]
+struct PatchLighting {
+    origin: [f32; 2],
+    level: [f32; 3],
+    dx: [f32; 3],
+    dy: [f32; 3],
+}
+impl PatchLighting {
+    fn at(self, x: f32, y: f32) -> [f32; 3] {
+        std::array::from_fn(|c| {
+            (self.level[c] + self.dx[c] * (x - self.origin[0]) + self.dy[c] * (y - self.origin[1]))
+                .clamp(-0.15, 0.15)
+        })
+    }
+}
+fn patch_lighting(
+    boundary: &[[f32; 2]],
+    offset: [f32; 2],
+    dims: (u32, u32),
+    sample: impl Fn(f32, f32) -> [f32; 4],
+) -> PatchLighting {
+    let (w, h) = dims;
+    let mut samples = Vec::with_capacity(boundary.len() * 8);
+    for (i, a) in boundary.iter().enumerate() {
+        let b = boundary[(i + 1) % boundary.len()];
+        for step in 0..8 {
+            let t = (step as f32 + 0.5) / 8.;
+            let (x, y) = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t);
+            let (sx, sy) = (x + offset[0], y + offset[1]);
+            if x < 0.
+                || y < 0.
+                || sx < 0.
+                || sy < 0.
+                || x > (w - 1) as f32
+                || y > (h - 1) as f32
+                || sx > (w - 1) as f32
+                || sy > (h - 1) as f32
+            {
+                continue;
+            }
+            let target = sample(x, y);
+            let donor = sample(sx, sy);
+            samples.push((
+                [x, y],
+                std::array::from_fn::<_, 3, _>(|c| target[c] - donor[c]),
+            ));
+        }
+    }
+    if samples.is_empty() {
+        return PatchLighting::default();
+    }
+    let n = samples.len() as f32;
+    let mut lighting = PatchLighting::default();
+    for (point, delta) in &samples {
+        for (c, value) in point.iter().enumerate() {
+            lighting.origin[c] += value / n;
+        }
+        for (c, value) in delta.iter().enumerate() {
+            lighting.level[c] += value / n;
+        }
+    }
+    let (mut xx, mut xy, mut yy) = (0., 0., 0.);
+    let (mut xd, mut yd) = ([0.; 3], [0.; 3]);
+    for (point, delta) in samples {
+        let (x, y) = (point[0] - lighting.origin[0], point[1] - lighting.origin[1]);
+        xx += x * x;
+        xy += x * y;
+        yy += y * y;
+        for c in 0..3 {
+            xd[c] += x * (delta[c] - lighting.level[c]);
+            yd[c] += y * (delta[c] - lighting.level[c]);
+        }
+    }
+    let determinant = xx * yy - xy * xy;
+    if determinant > 1e-6 && determinant.is_finite() {
+        for c in 0..3 {
+            lighting.dx[c] = (xd[c] * yy - yd[c] * xy) / determinant;
+            lighting.dy[c] = (yd[c] * xx - xd[c] * xy) / determinant;
+        }
+    }
+    lighting
 }
 
 fn sample_image(image: &RgbaImage, x: f32, y: f32) -> [f32; 4] {
@@ -78,6 +167,9 @@ fn sample_image(image: &RgbaImage, x: f32, y: f32) -> [f32; 4] {
 }
 
 impl PreparedCleanup {
+    pub(crate) fn append(&mut self, newer: Self) {
+        self.operations.extend(newer.operations);
+    }
     pub fn bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.operations.capacity() * std::mem::size_of::<PreparedOperation>()
@@ -172,7 +264,7 @@ impl PreparedCleanup {
                     center: [cx, cy],
                     radius,
                     softness: stroke.softness,
-                    strength: healing,
+                    strength: healing * (stroke.strength / 100.0).clamp(0.0, 1.0),
                     offset: best.1,
                     correction: best.2,
                     clip_source: false,
@@ -307,14 +399,15 @@ impl PreparedCleanup {
                                 let t = (edge_distance / patch.feather).clamp(0.0, 1.0);
                                 t * t * (3.0 - 2.0 * t)
                             };
-                            let sx = point[0] + patch.offset[0];
-                            let sy = point[1] + patch.offset[1];
+                            let sx = x as f32 + patch.offset[0];
+                            let sy = y as f32 + patch.offset[1];
                             if sx < 0.0 || sy < 0.0 || sx > (w - 1) as f32 || sy > (h - 1) as f32 {
                                 continue;
                             }
                             let mut clean = sample_image(source, sx, sy);
+                            let correction = patch.correction.at(x as f32, y as f32);
                             for (c, value) in clean.iter_mut().enumerate().take(3) {
-                                *value = (*value + patch.correction[c]).clamp(0.0, 1.0);
+                                *value = (*value + correction[c]).clamp(0.0, 1.0);
                             }
                             (clean, feather_weight * patch.strength.clamp(0.0, 1.0))
                         }
@@ -363,38 +456,7 @@ fn prepare_patch(source: &RgbaImage, patch: &PatchStroke) -> Option<PreparedPatc
         return None;
     }
     let offset = [patch.offset[0] * w as f32, patch.offset[1] * h as f32];
-    let mut correction = [0.0; 3];
-    let mut samples = 0.0;
-    for i in 0..boundary.len() {
-        let (a, b) = (boundary[i], boundary[(i + 1) % boundary.len()]);
-        for sample_index in 0..8 {
-            let t = (sample_index as f32 + 0.5) / 8.0;
-            let (x, y) = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t);
-            let (sx, sy) = (x + offset[0], y + offset[1]);
-            if x < 0.0
-                || y < 0.0
-                || x > (w - 1) as f32
-                || y > (h - 1) as f32
-                || sx < 0.0
-                || sy < 0.0
-                || sx > (w - 1) as f32
-                || sy > (h - 1) as f32
-            {
-                continue;
-            }
-            let target = sample_image(source, x, y);
-            let clean = sample_image(source, sx, sy);
-            for c in 0..3 {
-                correction[c] += target[c] - clean[c];
-            }
-            samples += 1.0;
-        }
-    }
-    if samples > 0.0 {
-        for c in &mut correction {
-            *c = (*c / samples).clamp(-0.15, 0.15);
-        }
-    }
+    let correction = patch_lighting(&boundary, offset, (w, h), |x, y| sample_image(source, x, y));
     Some(PreparedPatch {
         boundary,
         offset,
@@ -405,7 +467,7 @@ fn prepare_patch(source: &RgbaImage, patch: &PatchStroke) -> Option<PreparedPatc
             width: max_x - min_x,
             height: max_y - min_y,
         },
-        feather: (right - left).min(bottom - top).max(1.0) * 0.12 * patch.softness.clamp(0.0, 1.0),
+        feather: (right - left).min(bottom - top).max(1.0) * 0.25 * patch.softness.clamp(0.0, 1.0),
         strength: patch.strength / 100.0,
     })
 }
@@ -465,6 +527,44 @@ pub fn apply(
         return None;
     }
     let mut result = linear.to_vec();
+    apply_into(&mut result, linear, fine, w, h, edit);
+    Some(result)
+}
+
+/// Only reuse a completed prefix when new operations follow the original processing order.
+/// A heal added beneath an existing clone or patch requires a full rebuild.
+pub(crate) fn appended_edit(
+    strokes: &[crate::engine::Stroke],
+    clones: &[CloneStamp],
+    patches: &[PatchStroke],
+    healing: f32,
+    edit: &Edit,
+) -> Option<Edit> {
+    if healing != edit.settings.effective().healing
+        || !edit.strokes.starts_with(strokes)
+        || !edit.clones.starts_with(clones)
+        || !edit.patches.starts_with(patches)
+        || (edit.strokes.len() > strokes.len() && (!clones.is_empty() || !patches.is_empty()))
+        || (edit.clones.len() > clones.len() && !patches.is_empty())
+    {
+        return None;
+    }
+    let mut suffix = edit.clone();
+    suffix.strokes = edit.strokes[strokes.len()..].to_vec().into();
+    suffix.clones = edit.clones[clones.len()..].to_vec().into();
+    suffix.patches = edit.patches[patches.len()..].to_vec().into();
+    Some(suffix)
+}
+
+pub(crate) fn apply_into(
+    result: &mut [[f32; 4]],
+    linear: &[[f32; 4]],
+    fine: Option<&[[f16; 4]]>,
+    w: u32,
+    h: u32,
+    edit: &Edit,
+) {
+    let healing = edit.settings.effective().healing / 100.0;
     // Each healed patch selects a nearby intact texture whose boundary best matches the destination.
     for stroke in edit
         .strokes
@@ -522,12 +622,12 @@ pub fn apply(
             continue;
         }
         stamp(
-            &mut result,
+            result,
             (w, h),
             [cx, cy],
             radius,
             stroke.softness,
-            healing,
+            healing * (stroke.strength / 100.0).clamp(0.0, 1.0),
             |x, y| {
                 let mut p = sample(linear, w, h, x + best.1[0], y + best.1[1]);
                 for (c, value) in p.iter_mut().enumerate().take(3) {
@@ -544,7 +644,7 @@ pub fn apply(
             (clone.source[1] - clone.center[1]) * h as f32,
         ];
         stamp(
-            &mut result,
+            result,
             (w, h),
             center,
             (clone.radius * w.min(h) as f32).max(0.5),
@@ -561,9 +661,8 @@ pub fn apply(
         );
     }
     for patch in &edit.patches {
-        apply_patch(&mut result, linear, (w, h), patch);
+        apply_patch(result, linear, (w, h), patch);
     }
-    Some(result)
 }
 
 fn apply_patch(
@@ -612,40 +711,7 @@ fn apply_patch(
         return;
     }
     let offset = [patch.offset[0] * w as f32, patch.offset[1] * h as f32];
-    let mut correction = [0.0; 3];
-    let mut correction_samples = 0.0;
-    for i in 0..boundary.len() {
-        let a = boundary[i];
-        let b = boundary[(i + 1) % boundary.len()];
-        for sample_index in 0..8 {
-            let t = (sample_index as f32 + 0.5) / 8.0;
-            let x = a[0] + (b[0] - a[0]) * t;
-            let y = a[1] + (b[1] - a[1]) * t;
-            let (source_x, source_y) = (x + offset[0], y + offset[1]);
-            if x < 0.0
-                || y < 0.0
-                || x > (w - 1) as f32
-                || y > (h - 1) as f32
-                || source_x < 0.0
-                || source_y < 0.0
-                || source_x > (w - 1) as f32
-                || source_y > (h - 1) as f32
-            {
-                continue;
-            }
-            let target = sample(source, w, h, x, y);
-            let clean = sample(source, w, h, source_x, source_y);
-            for c in 0..3 {
-                correction[c] += target[c] - clean[c];
-            }
-            correction_samples += 1.0;
-        }
-    }
-    if correction_samples > 0.0 {
-        for value in &mut correction {
-            *value = (*value / correction_samples).clamp(-0.15, 0.15);
-        }
-    }
+    let correction = patch_lighting(&boundary, offset, (w, h), |x, y| sample(source, w, h, x, y));
     let bounds_width = boundary
         .iter()
         .map(|p| p[0])
@@ -656,7 +722,7 @@ fn apply_patch(
         .map(|p| p[1])
         .fold(f32::NEG_INFINITY, f32::max)
         - boundary.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
-    let feather = bounds_width.min(bounds_height).max(1.0) * 0.12 * patch.softness.clamp(0.0, 1.0);
+    let feather = bounds_width.min(bounds_height).max(1.0) * 0.25 * patch.softness.clamp(0.0, 1.0);
     let strength = patch.strength / 100.0;
     for y in min_y..max_y {
         for x in min_x..max_x {
@@ -675,7 +741,7 @@ fn apply_patch(
                 let t = (edge_distance / feather).clamp(0.0, 1.0);
                 t * t * (3.0 - 2.0 * t)
             };
-            let (source_x, source_y) = (point[0] + offset[0], point[1] + offset[1]);
+            let (source_x, source_y) = (x as f32 + offset[0], y as f32 + offset[1]);
             if source_x < 0.0
                 || source_y < 0.0
                 || source_x > (w - 1) as f32
@@ -684,6 +750,7 @@ fn apply_patch(
                 continue;
             }
             let mut clean = sample(source, w, h, source_x, source_y);
+            let correction = correction.at(x as f32, y as f32);
             for c in 0..3 {
                 clean[c] = (clean[c] + correction[c]).clamp(0.0, 1.0);
             }
@@ -760,6 +827,156 @@ fn stamp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn patch_matches_a_changing_light_gradient_without_blurring_donor_texture() {
+        let clean: Vec<_> = (0..64 * 64)
+            .map(|i| {
+                let x = (i % 64) as f32;
+                let y = (i / 64) as f32;
+                let pores = if i % 64 % 2 == i / 64 % 2 {
+                    0.006
+                } else {
+                    -0.006
+                };
+                [
+                    0.15 + 0.00006 * x * x + pores,
+                    0.12 + 0.00004 * y * y + pores,
+                    0.1 + pores,
+                    1.,
+                ]
+            })
+            .collect();
+        let mut source = clean.clone();
+        for y in 22..27 {
+            for x in 22..27 {
+                source[y * 64 + x] = [0.02, 0.01, 0.01, 1.];
+            }
+        }
+        let mut edit = Edit::default();
+        edit.patches.push(PatchStroke {
+            boundary: vec![[0.25, 0.25], [0.5, 0.25], [0.5, 0.5], [0.25, 0.5]],
+            offset: [0.25, 0.],
+            softness: 0.,
+            strength: 100.,
+        });
+        let output = apply(&source, None, 64, 64, &edit).unwrap();
+        for y in 16..32 {
+            for x in 16..32 {
+                for c in 0..4 {
+                    assert!(
+                        (output[y * 64 + x][c] - clean[y * 64 + x][c]).abs() < 0.00002,
+                        "The transferred patch must retain the destination's light gradient at {x},{y}, channel {c}"
+                    );
+                }
+            }
+        }
+        assert!(
+            (output[24 * 64 + 24][0] - output[24 * 64 + 25][0]).abs() > 0.005,
+            "The lighting match must not flatten the transferred pores"
+        );
+        assert_eq!(output[0], source[0]);
+    }
+
+    #[test]
+    fn patch_pixel_grid_preserves_identity_and_integer_transfers_without_texture_blur() {
+        let source = RgbaImage::from_fn(64, 64, |x, y| {
+            image::Rgba([if (x + y) % 2 == 0 { 180 } else { 80 }, 120, 100, 255])
+        });
+        let mut edit = Edit::default();
+        edit.patches.push(PatchStroke {
+            boundary: vec![[0.125, 0.125], [0.25, 0.125], [0.25, 0.25], [0.125, 0.25]],
+            offset: [0., 0.],
+            softness: 0.,
+            strength: 100.,
+        });
+        let linear = linear_pixels(&source);
+        assert_eq!(apply(&linear, None, 64, 64, &edit).unwrap(), linear);
+        let prepared =
+            PreparedCleanup::prepare(&source, &edit, |x, y| sample_image(&source, x, y)).unwrap();
+        let crop = crate::engine::Crop {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        };
+        assert_eq!(
+            prepared.apply_region(&source, &linear, crop).unwrap(),
+            linear
+        );
+
+        let mut damaged = source.clone();
+        for y in 9..15 {
+            for x in 9..15 {
+                damaged.put_pixel(x, y, image::Rgba([10, 10, 10, 255]));
+            }
+        }
+        edit.patches[0].offset = [0.25, 0.];
+        let linear = linear_pixels(&damaged);
+        let expected = apply(&linear, None, 64, 64, &edit).unwrap();
+        let prepared =
+            PreparedCleanup::prepare(&damaged, &edit, |x, y| sample_image(&damaged, x, y)).unwrap();
+        let actual = prepared.apply_region(&damaged, &linear, crop).unwrap();
+        assert_eq!(actual, expected);
+        for y in 9..15 {
+            for x in 9..15 {
+                assert_eq!(
+                    actual[(y * 64 + x) as usize],
+                    linear[(y * 64 + x + 16) as usize],
+                    "Texture at {x},{y} blurred or shifted"
+                );
+            }
+        }
+        assert_eq!(actual[0], linear[0]);
+    }
+
+    #[test]
+    fn healing_strength_is_per_stroke_and_legacy_strokes_default_to_full_strength() {
+        let legacy: crate::engine::Stroke =
+            ron::from_str("(target:Heal,center:(0.5,0.5),radius:0.07,erase:false,softness:0.5)")
+                .unwrap();
+        assert_eq!(legacy.strength, 100.);
+        let mut pixels: Vec<_> = (0..10000)
+            .map(|i| {
+                let texture = ((i % 100 + i / 100) % 2) as f32 * 0.03;
+                [0.45 + texture, 0.3 + texture, 0.2 + texture, 1.]
+            })
+            .collect();
+        for y in 48..53 {
+            for x in 48..53 {
+                pixels[y * 100 + x] = [0.02, 0.01, 0.01, 1.];
+            }
+        }
+        let fine = vec![[0.465, 0.315, 0.215, 1.].map(f16::from_f32); 10000];
+        let mut edit = Edit::default();
+        edit.strokes.push(legacy);
+        let full = apply(&pixels, Some(&fine), 100, 100, &edit).unwrap();
+        assert!(full[5050][0] > 0.4);
+        edit.strokes[0].strength = 25.;
+        let quarter = apply(&pixels, Some(&fine), 100, 100, &edit).unwrap();
+        assert!(
+            (quarter[5050][0] - (pixels[5050][0] + (full[5050][0] - pixels[5050][0]) * 0.25)).abs()
+                < 0.00001
+        );
+        edit.strokes[0].strength = 0.;
+        assert_eq!(
+            apply(&pixels, Some(&fine), 100, 100, &edit).unwrap(),
+            pixels
+        );
+        edit.strokes[0].strength = 25.;
+        let previous = quarter;
+        let mut next = edit.strokes[0].clone();
+        next.center = [0.1, 0.1];
+        next.strength = 90.;
+        edit.strokes.push(next);
+        let result = apply(&pixels, Some(&fine), 100, 100, &edit).unwrap();
+        assert_eq!(
+            previous[5050], result[5050],
+            "Changing the next stroke must not increase earlier healing"
+        );
+        let restored: Edit = ron::from_str(&ron::to_string(&edit).unwrap()).unwrap();
+        assert_eq!(restored, edit);
+    }
     fn linear_pixels(source: &RgbaImage) -> Vec<[f32; 4]> {
         source
             .pixels()
@@ -793,6 +1010,7 @@ mod tests {
                 center,
                 radius: 0.045,
                 erase: false,
+                strength: 100.0,
                 softness: 0.73,
             });
         }
@@ -860,6 +1078,7 @@ mod tests {
             center: [0.55, 0.55],
             radius: 0.035,
             erase: false,
+            strength: 100.0,
             softness: 0.5,
         });
         let prepared =
@@ -895,6 +1114,7 @@ mod tests {
             center: [0.5, 0.5],
             radius: 0.05,
             erase: false,
+            strength: 100.0,
             softness: 0.65,
         });
         let cancel = AtomicBool::new(false);
@@ -937,6 +1157,7 @@ mod tests {
             center: [0.5; 2],
             radius: 0.07,
             erase: false,
+            strength: 100.0,
             softness: 0.5,
         });
         let result = apply(&pixels, Some(&fine), 100, 100, &edit).unwrap();

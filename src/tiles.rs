@@ -1,5 +1,6 @@
 //! Bounded native-resolution processing with global image coordinates and filter halos.
 use super::*;
+use std::borrow::Cow;
 use std::cell::RefCell;
 
 const EDGE: u32 = 512;
@@ -38,28 +39,37 @@ fn linear_region(image: &RgbaImage, crop: Crop) -> Vec<[f32; 4]> {
 }
 
 /// Small LRU for globally registered blur samples, including remote healing donors.
+type BlurTiles = RefCell<VecDeque<(usize, Crop, Vec<[f16; 4]>)>>;
 struct BlurSampler<'a> {
     source: &'a RgbaImage,
     radius: usize,
-    tiles: RefCell<VecDeque<(Crop, Vec<[f16; 4]>)>>,
+    tiles: Cow<'a, BlurTiles>,
 }
 impl<'a> BlurSampler<'a> {
     fn new(source: &'a RgbaImage, radius: usize) -> Self {
+        Self::new_cached(source, radius, None)
+    }
+    fn new_cached(source: &'a RgbaImage, radius: usize, tiles: Option<&'a BlurTiles>) -> Self {
         Self {
             source,
             radius,
-            tiles: RefCell::new(VecDeque::new()),
+            tiles: tiles.map_or_else(|| Cow::Owned(BlurTiles::default()), Cow::Borrowed),
         }
     }
     fn at(&self, x: u32, y: u32) -> [f32; 4] {
         let x = x.min(self.source.width() - 1);
         let y = y.min(self.source.height() - 1);
-        let mut tiles = self.tiles.borrow_mut();
-        let hit = tiles.iter().position(|(crop, _)| {
-            x >= crop.x && y >= crop.y && x < crop.x + crop.width && y < crop.y + crop.height
+        let mut tiles = self.tiles.as_ref().borrow_mut();
+        let hit = tiles.iter().position(|(radius, crop, _)| {
+            *radius == self.radius
+                && x >= crop.x
+                && y >= crop.y
+                && x < crop.x + crop.width
+                && y < crop.y + crop.height
         });
         let (crop, data) = if let Some(i) = hit {
-            tiles.remove(i).unwrap()
+            let (_, crop, data) = tiles.remove(i).unwrap();
+            (crop, data)
         } else {
             let crop = Crop {
                 x: x / EDGE * EDGE,
@@ -85,8 +95,10 @@ impl<'a> BlurSampler<'a> {
             (crop, data)
         };
         let value = data[((y - crop.y) * crop.width + x - crop.x) as usize].map(f16::to_f32);
-        tiles.push_front((crop, data));
-        tiles.truncate(4);
+        tiles.push_front((self.radius, crop, data));
+        // At most 16 MiB of immutable donor pixels per native source. Reuse
+        // across stamps and pans; radius is part of each entry's identity.
+        tiles.truncate(8);
         value
     }
     fn sample(&self, x: f32, y: f32) -> [f32; 4] {
@@ -222,18 +234,27 @@ struct Prepared<'a> {
 /// Prepared corrections are reused when panning; image pixels remain in bounded tiles.
 #[derive(Default)]
 pub(super) struct NativeCache {
+    warp: crate::geometry::WarpCache,
     segmentation: Option<Arc<Segmentation>>,
     flyaway: Option<Arc<crate::flyaway::FlyawayMap>>,
     cleanup_key: Option<Edit>,
     cleanup: Option<Arc<crate::cleanup::PreparedCleanup>>,
+    donor_blur: BlurTiles,
     #[cfg(feature = "onnx")]
     eyes: Option<(SharedVec<Stroke>, Arc<Vec<UnderEyeReference>>)>,
 }
 impl NativeCache {
     pub(super) fn bytes(&self) -> usize {
         self.flyaway.as_ref().map_or(0, |m| m.bytes())
+            + self.warp.bytes()
             + self.cleanup.as_ref().map_or(0, |m| m.bytes())
             + self.segmentation.as_ref().map_or(0, |s| s.map_bytes())
+            + self
+                .donor_blur
+                .borrow()
+                .iter()
+                .map(|(_, _, pixels)| pixels.len() * std::mem::size_of::<[f16; 4]>())
+                .sum::<usize>()
     }
 }
 impl<'a> Prepared<'a> {
@@ -273,8 +294,8 @@ impl<'a> Prepared<'a> {
                 }
             }
         }
-        let make_cleanup = || {
-            let sampler = BlurSampler::new(image, radius);
+        let make_cleanup = |tiles: Option<&BlurTiles>| {
+            let sampler = BlurSampler::new_cached(image, radius, tiles);
             crate::cleanup::PreparedCleanup::prepare_cancellable(
                 image,
                 edit,
@@ -285,18 +306,39 @@ impl<'a> Prepared<'a> {
         };
         let cleanup = if let Some(c) = cache.as_mut() {
             let same = c.cleanup_key.as_ref().is_some_and(|k| {
-                k.strokes.same_storage(&edit.strokes)
-                    && k.clones.same_storage(&edit.clones)
-                    && k.patches.same_storage(&edit.patches)
+                (k.strokes.same_storage(&edit.strokes) || k.strokes == edit.strokes)
+                    && (k.clones.same_storage(&edit.clones) || k.clones == edit.clones)
+                    && (k.patches.same_storage(&edit.patches) || k.patches == edit.patches)
                     && k.settings.effective().healing == s.healing
             });
             if !same {
-                c.cleanup = make_cleanup()?;
+                let suffix = c.cleanup_key.as_ref().and_then(|key| {
+                    crate::cleanup::appended_edit(
+                        &key.strokes,
+                        &key.clones,
+                        &key.patches,
+                        key.settings.effective().healing,
+                        edit,
+                    )
+                });
+                if let (Some(suffix), Some(previous)) = (suffix, c.cleanup.as_mut()) {
+                    let sampler = BlurSampler::new_cached(image, radius, Some(&c.donor_blur));
+                    if let Some(newer) = crate::cleanup::PreparedCleanup::prepare_cancellable(
+                        image,
+                        &suffix,
+                        |x, y| sampler.sample(x, y),
+                        cancel,
+                    )? {
+                        Arc::make_mut(previous).append(newer);
+                    }
+                } else {
+                    c.cleanup = make_cleanup(Some(&c.donor_blur))?;
+                }
                 c.cleanup_key = Some(edit.clone());
             }
             c.cleanup.clone()
         } else {
-            make_cleanup()?
+            make_cleanup(None)?
         };
         check_cancel(cancel)?;
         let color = crate::color::PreparedColor::new(&s.color, image);
@@ -318,10 +360,9 @@ impl<'a> Prepared<'a> {
         #[cfg(feature = "onnx")]
         let eyes = if s.under_eyes != 0.0 {
             if let Some(c) = cache.as_mut() {
-                let same = c
-                    .eyes
-                    .as_ref()
-                    .is_some_and(|(strokes, _)| strokes.same_storage(&edit.strokes));
+                let same = c.eyes.as_ref().is_some_and(|(strokes, _)| {
+                    strokes.same_storage(&edit.strokes) || *strokes == edit.strokes
+                });
                 if !same {
                     c.eyes = Some((
                         edit.strokes.clone(),
@@ -491,6 +532,8 @@ pub(super) fn render(
     seg: Option<&Segmentation>,
     cancel: Option<&AtomicBool>,
 ) -> Result<RgbaImage> {
+    let effective = edit.effective_layers();
+    let edit = effective.as_ref();
     if image.width() == 0 || image.height() == 0 {
         return Ok(image.clone());
     }
@@ -517,7 +560,7 @@ pub(super) fn render_region_cached(
     seg: Option<&Segmentation>,
     crop: Crop,
     cancel: Option<&AtomicBool>,
-    cache: Option<&mut NativeCache>,
+    mut cache: Option<&mut NativeCache>,
     shared_seg: Option<&Arc<Segmentation>>,
 ) -> Result<RgbaImage> {
     anyhow::ensure!(
@@ -533,12 +576,19 @@ pub(super) fn render_region_cached(
                 .is_some_and(|b| b <= image.height()),
         "Invalid native render region"
     );
-    let prepared = Prepared::new_cached(image, edit, seg, cancel, cache, shared_seg)?;
+    let effective = edit.effective_layers();
+    let edit = effective.as_ref();
+    let prepared =
+        Prepared::new_cached(image, edit, seg, cancel, cache.as_deref_mut(), shared_seg)?;
     if !crate::geometry::active(edit, seg) {
         return prepared.unwarped(crop, cancel);
     }
     // The same deformation grid is used for viewport renders and complete exports.
-    let field = crate::geometry::DisplacementField::new(edit, seg, image.dimensions());
+    let field = if let Some(cache) = cache {
+        cache.warp.displacement(edit, seg, image.dimensions())
+    } else {
+        crate::geometry::DisplacementField::new(edit, seg, image.dimensions())
+    };
     let mut min = [image.width() - 1, image.height() - 1];
     let mut max = [0; 2];
     let mut coordinates = Vec::with_capacity((crop.width * crop.height) as usize);
@@ -677,6 +727,7 @@ mod tests {
             center: [0.48, 0.65],
             radius: 0.1,
             erase: true,
+            strength: 100.0,
             softness: 0.75,
         });
         edit.strokes.push(Stroke {
@@ -684,6 +735,7 @@ mod tests {
             center: [0.5, 0.6],
             radius: 0.01,
             erase: false,
+            strength: 100.0,
             softness: 0.8,
         });
         edit.clones.push(crate::cleanup::CloneStamp {
@@ -712,6 +764,103 @@ mod tests {
         let max = *diffs.iter().max().unwrap();
         let mean = diffs.iter().map(|d| *d as f64).sum::<f64>() / diffs.len() as f64;
         assert!(max <= 1 && mean < 0.05, "max difference {max}, mean {mean}");
+    }
+    #[test]
+    fn layered_full_and_native_renders_match_and_native_opacity_reuses_cleanup() {
+        use crate::layers::LayerKind;
+        let (image, seg, mut edit) = fixture();
+        edit.settings.background = Background::Solid;
+        edit.warps.push(crate::geometry::WarpStroke {
+            center: [0.52, 0.64],
+            delta: [0.012, -0.015],
+            radius: 0.12,
+            softness: 0.7,
+            strength: 80.0,
+        });
+        for (kind, opacity) in [
+            (LayerKind::Portrait, 75.0),
+            (LayerKind::Color, 60.0),
+            (LayerKind::Background, 40.0),
+            (LayerKind::Liquify, 35.0),
+            (LayerKind::SpotHeal, 50.0),
+            (LayerKind::CloneStamp, 25.0),
+            (LayerKind::Patch, 65.0),
+        ] {
+            edit.layers.get_mut(kind).opacity = opacity;
+        }
+        let effective = edit.effective_layers();
+        let reference = render_inner(&image, &effective, Some(&seg), None, None, None).unwrap();
+        close(
+            &render(&image, &edit, Some(&seg), None).unwrap(),
+            &reference,
+        );
+        let crop = Crop {
+            x: 489,
+            y: 472,
+            width: 67,
+            height: 103,
+        };
+        let expected =
+            image::imageops::crop_imm(&reference, crop.x, crop.y, crop.width, crop.height)
+                .to_image();
+        close(
+            &render_region(&image, &edit, Some(&seg), crop, None).unwrap(),
+            &expected,
+        );
+        let seg = Arc::new(seg);
+        let mut cache = NativeCache::default();
+        render_region_cached(
+            &image,
+            &edit,
+            Some(&seg),
+            crop,
+            None,
+            Some(&mut cache),
+            Some(&seg),
+        )
+        .unwrap();
+        let cleanup = cache.cleanup.as_ref().unwrap().clone();
+        render_region_cached(
+            &image,
+            &edit,
+            Some(&seg),
+            crop,
+            None,
+            Some(&mut cache),
+            Some(&seg),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&cleanup, cache.cleanup.as_ref().unwrap()));
+        edit.layers.get_mut(LayerKind::CloneStamp).visible = false;
+        render_region_cached(
+            &image,
+            &edit,
+            Some(&seg),
+            crop,
+            None,
+            Some(&mut cache),
+            Some(&seg),
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&cleanup, cache.cleanup.as_ref().unwrap()));
+        for kind in LayerKind::ALL {
+            edit.layers.get_mut(kind).visible = false;
+        }
+        let hidden = render_region_cached(
+            &image,
+            &edit,
+            Some(&seg),
+            crop,
+            None,
+            Some(&mut cache),
+            Some(&seg),
+        )
+        .unwrap();
+        assert_eq!(
+            hidden,
+            image::imageops::crop_imm(&image, crop.x, crop.y, crop.width, crop.height).to_image()
+        );
+        assert_eq!(edit.warps[0].strength, 80.0);
     }
     #[test]
     fn tiled_all_adjustments_masks_remote_donors_and_background_have_no_seams() {
@@ -909,5 +1058,32 @@ mod tests {
             &render_region(&other, &edit, Some(&seg), crop, None).unwrap(),
         );
         assert_eq!(renderer.native_sources.len(), 2);
+    }
+
+    #[test]
+    fn donor_filter_cache_reuses_pixels_separates_radii_and_stays_bounded() {
+        let image = RgbaImage::from_fn(1600, 1600, |x, y| {
+            image::Rgba([(x % 251) as u8, (y % 251) as u8, 90, 255])
+        });
+        let cache = BlurTiles::default();
+        let first = BlurSampler::new_cached(&image, 3, Some(&cache)).sample(65.3, 72.8);
+        let allocation = cache.borrow()[0].2.as_ptr();
+        assert_eq!(
+            first,
+            BlurSampler::new_cached(&image, 3, Some(&cache)).sample(65.3, 72.8)
+        );
+        assert_eq!(allocation, cache.borrow()[0].2.as_ptr());
+        let larger = BlurSampler::new_cached(&image, 9, Some(&cache)).sample(65.3, 72.8);
+        assert_eq!(larger, BlurSampler::new(&image, 9).sample(65.3, 72.8));
+        assert_eq!(cache.borrow().len(), 2);
+        for y in [70., 600., 1100.] {
+            for x in [70., 600., 1100., 1590.] {
+                let actual = BlurSampler::new_cached(&image, 3, Some(&cache)).sample(x, y);
+                assert_eq!(actual, BlurSampler::new(&image, 3).sample(x, y));
+            }
+        }
+        let retained = cache.borrow();
+        assert_eq!(retained.len(), 8);
+        assert!(retained.iter().map(|(_, _, p)| p.len() * 8).sum::<usize>() <= 16 * 1024 * 1024);
     }
 }

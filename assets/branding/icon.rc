@@ -1,0 +1,2 @@
+// Keep icon group 1 first so Windows Explorer uses it for the executable.
+1 ICON "assets/branding/hastur.ico"

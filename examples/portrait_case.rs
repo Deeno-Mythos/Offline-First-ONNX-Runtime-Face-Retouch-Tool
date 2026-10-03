@@ -1,6 +1,6 @@
 //! Real-photo under-eye regression images and lightweight history timings.
 use anyhow::{Result, ensure};
-use astra_retouch::{
+use hastur_retouch::{
     engine::{self, Edit, History, Target},
     model::{self, Provider},
 };

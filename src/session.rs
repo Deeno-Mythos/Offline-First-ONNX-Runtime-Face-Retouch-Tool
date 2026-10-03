@@ -62,9 +62,42 @@ pub(crate) fn read(path: &Path) -> Result<Session> {
         "Unsupported session version or too many photos"
     );
     for photo in &mut session.photos {
+        validate_stack(&photo.edit)?;
+        let (past, future) = photo.history.snapshots();
+        for edit in past.chain(future) {
+            validate_stack(edit)?;
+        }
         photo.history.share_current_storage(&mut photo.edit);
     }
     Ok(session)
+}
+
+fn validate_stack(edit: &Edit) -> Result<()> {
+    ensure!(edit.stack.layers.len() <= 32, "Too many image layers");
+    let mut ids = std::collections::HashSet::new();
+    for layer in &edit.stack.layers {
+        ensure!(
+            layer.id > 0 && ids.insert(layer.id) && layer.edit.stack.layers.is_empty(),
+            "Invalid or nested image layer"
+        );
+    }
+    ensure!(
+        edit.stack.active == 0 || ids.contains(&edit.stack.active),
+        "Missing selected image layer"
+    );
+    if let Some(solo) = &edit.stack.solo {
+        let mut restored_ids = std::collections::HashSet::new();
+        ensure!(
+            ids.contains(&solo.layer)
+                && solo.visibility.len() == ids.len()
+                && solo
+                    .visibility
+                    .iter()
+                    .all(|(id, _)| ids.contains(id) && restored_ids.insert(*id)),
+            "Invalid solo layer visibility"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn save(path: &Path, session: &Session) -> Result<()> {
@@ -113,6 +146,10 @@ mod compact_history {
     #[derive(Serialize, Deserialize)]
     struct Snapshot {
         settings: Settings,
+        #[serde(default)]
+        layers: crate::layers::LayerControls,
+        #[serde(default)]
+        stack: crate::layer_stack::LayerStack,
         preset: Option<String>,
         strokes: usize,
         warps: usize,
@@ -188,6 +225,8 @@ mod compact_history {
         let (mut strokes, mut warps, mut clones, mut patches) = (vec![], vec![], vec![], vec![]);
         let mut snapshot = |edit: &Edit| Snapshot {
             settings: edit.settings.clone(),
+            layers: edit.layers.clone(),
+            stack: edit.stack.clone(),
             preset: edit.preset.clone(),
             strokes: append(&edit.strokes, &mut strokes, &mut packed.strokes),
             warps: append(&edit.warps, &mut warps, &mut packed.warps),
@@ -211,6 +250,8 @@ mod compact_history {
         let snapshot = |saved: Snapshot| -> Result<Edit, D::Error> {
             Ok(Edit {
                 settings: saved.settings,
+                layers: saved.layers,
+                stack: saved.stack,
                 preset: saved.preset,
                 strokes: strokes
                     .get(saved.strokes)
@@ -243,28 +284,52 @@ mod compact_history {
                 .collect::<Result<_, _>>()?,
         ))
     }
+
+    #[cfg(test)]
+    #[test]
+    fn legacy_history_snapshot_defaults_to_fully_visible_layers() {
+        let snapshot: Snapshot =
+            ron::from_str("(settings:(),preset:None,strokes:0,warps:0,clones:0,patches:0)")
+                .unwrap();
+        assert!(snapshot.layers.is_default());
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct RecoveryCandidate {
     pub path: PathBuf,
     pub modified: SystemTime,
-    pub bytes: u64,
 }
 pub(crate) struct RecoveryStore {
     pub path: PathBuf,
     lease: Option<File>,
 }
 
-fn recovery_directory() -> PathBuf {
-    if let Some(root) = std::env::var_os("ASTRA_RECOVERY_DIR") {
-        return root.into();
-    }
+fn recovery_directories() -> Vec<PathBuf> {
     let root = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_STATE_HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    root.join("AstraRetouch").join("recovery")
+    recovery_locations(
+        &root,
+        std::env::var_os("HASTUR_RECOVERY_DIR").as_deref(),
+        std::env::var_os("ASTRA_RECOVERY_DIR").as_deref(),
+    )
+}
+fn recovery_locations(
+    root: &Path,
+    hastur_override: Option<&std::ffi::OsStr>,
+    astra_override: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    // An explicit override stays isolated from every default location. The old override
+    // remains usable by launch scripts, while the new name wins when both are present.
+    if let Some(directory) = hastur_override.or(astra_override) {
+        return vec![directory.into()];
+    }
+    vec![
+        root.join("HasturRetouch").join("recovery"),
+        root.join("AstraRetouch").join("recovery"),
+    ]
 }
 fn lease_options() -> OpenOptions {
     let mut options = OpenOptions::new();
@@ -278,7 +343,7 @@ fn lease_options() -> OpenOptions {
 }
 impl RecoveryStore {
     pub fn new() -> Result<Self> {
-        Self::in_directory(&recovery_directory())
+        Self::in_directory(&recovery_directories()[0])
     }
     pub(crate) fn in_directory(directory: &Path) -> Result<Self> {
         fs::create_dir_all(directory)?;
@@ -300,7 +365,17 @@ impl Drop for RecoveryStore {
     }
 }
 pub(crate) fn recovery_candidates() -> Vec<RecoveryCandidate> {
-    candidates_in(&recovery_directory())
+    candidates_in_directories(&recovery_directories())
+}
+fn candidates_in_directories(directories: &[PathBuf]) -> Vec<RecoveryCandidate> {
+    // Keep original paths: moving a legacy workspace could break another app's lease
+    // or separate a damaged latest generation from its usable previous generation.
+    let mut candidates: Vec<_> = directories
+        .iter()
+        .flat_map(|directory| candidates_in(directory))
+        .collect();
+    candidates.sort_by_key(|entry| std::cmp::Reverse(entry.modified));
+    candidates
 }
 fn candidates_in(directory: &Path) -> Vec<RecoveryCandidate> {
     let mut candidates = Vec::new();
@@ -320,7 +395,6 @@ fn candidates_in(directory: &Path) -> Vec<RecoveryCandidate> {
             candidates.push(RecoveryCandidate {
                 path,
                 modified: metadata.modified().unwrap_or(UNIX_EPOCH),
-                bytes: metadata.len(),
             });
         }
     }
@@ -407,6 +481,97 @@ mod tests {
         }
     }
     #[test]
+    fn layer_visibility_opacity_and_both_history_branches_survive_reopening() {
+        use crate::layers::LayerKind;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("layers.ron");
+        let mut session = fixture();
+        let photo = &mut session.photos[0];
+        photo.history.record(photo.edit.clone());
+        photo.edit.layers.get_mut(LayerKind::Portrait).visible = false;
+        let hidden = photo.edit.clone();
+        photo.history.record(photo.edit.clone());
+        photo.edit.layers.get_mut(LayerKind::Color).opacity = 42.0;
+        let faded = photo.edit.clone();
+        assert!(photo.history.undo(&mut photo.edit));
+        save(&path, &session).unwrap();
+        let mut restored = read(&path).unwrap();
+        let photo = &mut restored.photos[0];
+        assert_eq!(photo.edit, hidden);
+        assert_eq!(photo.history.depths(), (1, 1));
+        assert!(photo.history.redo(&mut photo.edit));
+        assert_eq!(photo.edit, faded);
+        assert!(photo.history.undo(&mut photo.edit));
+        assert_eq!(photo.edit, hidden);
+        assert!(photo.history.undo(&mut photo.edit));
+        assert_eq!(photo.edit, Edit::default());
+        assert!(photo.history.redo(&mut photo.edit));
+        assert_eq!(photo.edit, hidden);
+    }
+    #[test]
+    fn renamed_recovery_locations_keep_legacy_discovery_and_isolate_overrides() {
+        let root = Path::new("state-root");
+        assert_eq!(
+            recovery_locations(root, None, None),
+            vec![
+                root.join("HasturRetouch/recovery"),
+                root.join("AstraRetouch/recovery")
+            ]
+        );
+        let new = std::ffi::OsStr::new("new-isolated-recovery");
+        let old = std::ffi::OsStr::new("old-isolated-recovery");
+        assert_eq!(
+            recovery_locations(root, Some(new), Some(old)),
+            vec![PathBuf::from(new)]
+        );
+        assert_eq!(
+            recovery_locations(root, None, Some(old)),
+            vec![PathBuf::from(old)]
+        );
+    }
+    #[test]
+    fn legacy_recovery_is_read_in_place_with_previous_generation_and_both_history_branches() {
+        let root = tempfile::tempdir().unwrap();
+        let locations = recovery_locations(root.path(), None, None);
+        let primary = RecoveryStore::in_directory(&locations[0]).unwrap();
+        let legacy = RecoveryStore::in_directory(&locations[1]).unwrap();
+        assert!(primary.path.starts_with(root.path().join("HasturRetouch")));
+        let mut session = fixture();
+        let photo = &mut session.photos[0];
+        photo.history.record(photo.edit.clone());
+        photo.edit.settings.exposure = 0.3;
+        photo.history.record(photo.edit.clone());
+        photo.edit.settings.exposure = 0.7;
+        assert!(photo.history.undo(&mut photo.edit));
+        assert_eq!(photo.history.depths(), (1, 1));
+        save_recovery(&legacy.path, &session, 1).unwrap();
+        save_recovery(&legacy.path, &session, 2).unwrap();
+        fs::write(&legacy.path, "damaged latest legacy generation").unwrap();
+        save_recovery(&primary.path, &fixture(), 1).unwrap();
+        #[cfg(windows)]
+        assert!(candidates_in_directories(&locations).is_empty());
+        let (primary_path, legacy_path) = (primary.path.clone(), legacy.path.clone());
+        drop(primary);
+        drop(legacy);
+        let candidates = candidates_in_directories(&locations);
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().any(|c| c.path == primary_path));
+        assert!(candidates.iter().any(|c| c.path == legacy_path));
+        let legacy_contents = fs::read(&legacy_path).unwrap();
+        let previous_path = legacy_path.with_extension("previous");
+        let previous_contents = fs::read(&previous_path).unwrap();
+        let mut restored = read_recovery(&legacy_path).unwrap();
+        let photo = &mut restored.photos[0];
+        assert_eq!(photo.history.depths(), (1, 1));
+        assert_eq!(photo.edit.settings.exposure, 0.3);
+        assert!(photo.history.redo(&mut photo.edit));
+        assert_eq!(photo.edit.settings.exposure, 0.7);
+        assert_eq!(fs::read(&legacy_path).unwrap(), legacy_contents);
+        assert_eq!(fs::read(&previous_path).unwrap(), previous_contents);
+        assert_eq!(candidates_in(&locations[0]).len(), 1);
+        assert_eq!(candidates_in(&locations[1]).len(), 1);
+    }
+    #[test]
     fn session_replacement_keeps_snapshots_and_round_trips_old_vector_format() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.ron");
@@ -454,6 +619,7 @@ mod tests {
                 center: [0.2, step as f32 * 0.01],
                 radius: 0.01,
                 erase: false,
+                strength: 100.0,
                 softness: 0.7,
             });
             photo.edit.warps.push(WarpStroke {
@@ -515,6 +681,7 @@ mod tests {
                     center: [step as f32 / 100., index as f32 / 40.],
                     radius: 0.01,
                     erase: false,
+                    strength: 100.0,
                     softness: 0.7,
                 });
             }
@@ -612,6 +779,7 @@ mod tests {
                     center: [0.5, 0.5],
                     radius: 0.01,
                     erase: false,
+                    strength: 100.0,
                     softness: 0.7
                 };
                 100_000
@@ -625,7 +793,10 @@ mod tests {
             edit.strokes[0].center[0] = step as f32 / 100.0;
         }
         assert!(history.depths().0 < 60);
-        assert!(history.depths().0 >= 30);
+        // Per-stroke opacity is part of the saved instruction. Retain as many
+        // nearest snapshots as their actual allocations permit within 64 MiB.
+        let capacity = (64 * 1024 * 1024) / (100_000 * std::mem::size_of::<Stroke>());
+        assert!(history.depths().0 >= capacity - 1);
         assert!(history.instruction_storage_bytes() <= 64 * 1024 * 1024);
         assert!(history.undo(&mut edit));
         assert_eq!(edit.strokes[0].center[0], 0.58);

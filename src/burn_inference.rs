@@ -36,6 +36,7 @@ mod local_inpainting {
 }
 
 type Output = (Vec<i64>, Vec<f32>);
+type ModelKey = (PathBuf, u64, std::time::SystemTime);
 
 enum Model {
     FaceDetection(Box<face_detection::Model>),
@@ -48,24 +49,20 @@ enum Model {
 thread_local! {
     // The app's AI work is serialized per worker. Thread-local model caches avoid
     // re-reading 270+ MB of weights for each tile without cross-thread lock contention.
-    static MODELS: RefCell<HashMap<PathBuf, Model>> = RefCell::new(HashMap::new());
+    static MODELS: RefCell<HashMap<ModelKey, Model>> = RefCell::new(HashMap::new());
+}
+
+pub(crate) fn release_idle_resources() {
+    MODELS.with(|cache| cache.borrow_mut().clear());
+}
+
+pub(crate) fn resident_model_count() -> usize {
+    MODELS.with(|cache| cache.borrow().len())
 }
 
 fn model_path(name: &str) -> PathBuf {
     let stem = name.strip_suffix(".onnx").unwrap_or(name);
     crate::model::model_path(&format!("burn/{stem}.bpk"))
-}
-
-fn packs_available() -> bool {
-    [
-        "face_detection_short_range.onnx",
-        "face_landmarker_Nx3x256x256.onnx",
-        "retouch_generator.onnx",
-        "local_detection.onnx",
-        "local_inpainting.onnx",
-    ]
-    .iter()
-    .all(|name| model_path(name).is_file())
 }
 
 fn load_model(name: &str, path: &PathBuf) -> Result<Model> {
@@ -116,22 +113,28 @@ fn output<const D: usize>(tensor: Tensor<D>) -> Result<Output> {
 
 pub(crate) fn run(name: &str, inputs: &[Array4<f32>]) -> Result<Vec<Output>> {
     ensure!(
-        packs_available(),
-        "Burn model packs are missing. Run scripts/setup-ai.ps1 and rebuild the app."
-    );
-    ensure!(
         matches!(inputs.len(), 1 | 2),
         "Unexpected input count for {name}"
     );
 
     let start = std::time::Instant::now();
     let path = model_path(name);
+    let metadata = std::fs::metadata(&path).with_context(|| {
+        format!(
+            "Burn model pack {} is missing. Run scripts/setup-ai.ps1.",
+            path.display()
+        )
+    })?;
+    let key = (path, metadata.len(), metadata.modified()?);
     let result = MODELS.with(|cache| -> Result<Vec<Output>> {
         let mut cache = cache.borrow_mut();
-        if !cache.contains_key(&path) {
-            cache.insert(path.clone(), load_model(name, &path)?);
+        cache.retain(|(path, len, modified), _| {
+            path != &key.0 || (*len, *modified) == (key.1, key.2)
+        });
+        if !cache.contains_key(&key) {
+            cache.insert(key.clone(), load_model(name, &key.0)?);
         }
-        let model = cache.get(&path).expect("Burn model inserted");
+        let model = cache.get(&key).expect("Burn model inserted");
         let image = input_tensor(&inputs[0])?;
         let outputs = match model {
             Model::FaceDetection(model) => {
@@ -151,7 +154,9 @@ pub(crate) fn run(name: &str, inputs: &[Array4<f32>]) -> Result<Vec<Output>> {
         };
         Ok(outputs)
     })?;
-    if std::env::var_os("ASTRA_AI_TIMINGS").is_some() {
+    if std::env::var_os("HASTUR_AI_TIMINGS").is_some()
+        || std::env::var_os("ASTRA_AI_TIMINGS").is_some()
+    {
         eprintln!(
             "Burn {name}: {:.2} ms",
             start.elapsed().as_secs_f64() * 1000.

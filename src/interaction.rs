@@ -65,6 +65,7 @@ pub enum Gesture {
     Pan,
     Divider,
     Brush,
+    Source,
 }
 pub fn gesture_at(pos: Pos2, image: Rect, split: Option<f32>, brush: bool, space: bool) -> Gesture {
     if split.is_some_and(|s| {

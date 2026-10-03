@@ -1,5 +1,5 @@
 use anyhow::Result;
-use astra_retouch::engine::{self, Edit, ExportSize};
+use hastur_retouch::engine::{self, Edit, ExportSize};
 use std::path::Path;
 
 fn main() -> Result<()> {

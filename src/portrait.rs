@@ -1,53 +1,167 @@
 //! MediaPipe BlazeFace/478-point mesh and pretrained ModelScope skin retouching.
 //! Model contracts and upstream provenance are documented in models/README.md.
-use super::{Provider, model_path, session};
+use super::{AiStatus, Provider, model_path, session_with_profile};
 use crate::{
     engine::{Segmentation, sample_channel},
     geometry::{FaceMesh, sample_rgba},
+    nullstate::PortraitDemand,
 };
 use anyhow::{Result, bail, ensure};
 use image::RgbaImage;
 use ndarray::Array4;
 use ort::{session::Session, value::TensorRef};
 use rayon::prelude::*;
-use std::{cell::RefCell, collections::HashMap, path::PathBuf};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    path::PathBuf,
+};
 
 type SessionKey = (PathBuf, Provider, u64, std::time::SystemTime);
-thread_local! { static SESSIONS:RefCell<HashMap<SessionKey,Session>> = RefCell::new(HashMap::new()); }
-type Output = (Vec<i64>, Vec<f32>);
-fn run(name: &str, provider: Provider, inputs: &[Array4<f32>]) -> Result<Vec<Output>> {
-    #[cfg(astra_burn_models)]
-    if provider == Provider::Burn {
-        return crate::burn_inference::run(name, inputs);
-    }
-    #[cfg(not(astra_burn_models))]
-    if provider == Provider::Burn {
-        bail!("Burn models are not included in this build. Install AI models and rebuild.");
-    }
+struct SessionRecord {
+    session: Session,
+    verify_gpu: bool,
+}
+thread_local! {
+    static SESSIONS: RefCell<HashMap<SessionKey, SessionRecord>> = RefCell::new(HashMap::new());
+    static AUTO: RefCell<HashMap<SessionKey, (Provider, String)>> = RefCell::new(HashMap::new());
+    static REQUESTED: RefCell<Option<Provider>> = const { RefCell::new(None) };
+    static USED: RefCell<Vec<Provider>> = const { RefCell::new(Vec::new()) };
+    static FALLBACKS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static MODEL_TRACE: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static TRACING: Cell<bool> = const { Cell::new(false) };
+}
 
+/// Drain the current AI thread's recent logical model invocations for diagnostics.
+pub fn take_model_run_trace() -> Vec<String> {
+    TRACING.with(|tracing| tracing.set(true));
+    MODEL_TRACE.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
+}
+
+/// Resident model weights on the calling AI thread; disk result caches are separate.
+pub fn resident_model_count() -> usize {
+    let count = SESSIONS.with(|cache| cache.borrow().len());
+    #[cfg(astra_burn_models)]
+    let count = count + crate::burn_inference::resident_model_count();
+    count
+}
+
+/// Release unused weights on their owning worker without discarding GPU qualification.
+pub(crate) fn release_idle_resources() {
+    SESSIONS.with(|cache| cache.borrow_mut().clear());
+    #[cfg(astra_burn_models)]
+    crate::burn_inference::release_idle_resources();
+}
+type Output = (Vec<i64>, Vec<f32>);
+fn model_stage(name: &str) -> (&'static str, f32) {
+    match name {
+        "face_detection_short_range.onnx" => ("Detecting faces", 0.15),
+        "face_landmarker_Nx3x256x256.onnx" => ("Mapping facial landmarks", 0.3),
+        "retouch_generator.onnx" => ("Preparing neural skin retouch", 0.5),
+        "local_detection.onnx" => ("Detecting blemishes", 0.7),
+        _ => ("Preparing blemish repair", 0.9),
+    }
+}
+fn gpu_candidate() -> Provider {
+    if cfg!(windows) {
+        Provider::DirectMl
+    } else if cfg!(target_os = "macos") {
+        Provider::CoreMl
+    } else {
+        Provider::Cuda
+    }
+}
+fn record_used(provider: Provider) {
+    USED.with(|used| {
+        let mut used = used.borrow_mut();
+        if !used.contains(&provider) {
+            used.push(provider);
+        }
+    });
+}
+fn backend_label(requested: Provider) -> String {
+    if requested != Provider::Auto {
+        return requested.label().into();
+    }
+    USED.with(|used| {
+        let used = used.borrow();
+        if used.len() > 1 {
+            format!("{} GPU + CPU fallback", gpu_candidate().label())
+        } else if used.first() == Some(&Provider::Cpu) {
+            "CPU fallback".into()
+        } else {
+            format!("{} GPU", gpu_candidate().label())
+        }
+    })
+}
+fn output_agreement(cpu: &[Output], gpu: &[Output]) -> bool {
+    cpu.len() == gpu.len()
+        && cpu.iter().zip(gpu).all(|(a, b)| {
+            a.0 == b.0
+                && a.1.len() == b.1.len()
+                && a.1.iter().zip(&b.1).all(|(&c, &g)| {
+                    c.is_finite() && g.is_finite() && (c - g).abs() <= 0.005 + c.abs() * 0.003
+                })
+        })
+}
+fn profile_has_provider(profile: &str, provider: &str) -> bool {
+    profile.split("\"provider\"").skip(1).any(|tail| {
+        tail.trim_start()
+            .strip_prefix(':')
+            .and_then(|v| v.trim_start().strip_prefix('"'))
+            .is_some_and(|v| {
+                v.strip_prefix(provider)
+                    .is_some_and(|rest| rest.starts_with('"'))
+            })
+    })
+}
+fn run_ort(name: &str, provider: Provider, inputs: &[Array4<f32>]) -> Result<Vec<Output>> {
     let start = std::time::Instant::now();
     let result = SESSIONS.with(|cache| {
         let mut cache = cache.borrow_mut();
-        // Switching providers releases the previous provider's heavyweight model sessions.
         let path = model_path(name);
         let meta = std::fs::metadata(&path)?;
         let key = (path, provider, meta.len(), meta.modified()?);
-        cache.retain(|(path, p, len, modified), _| {
-            *p == provider && (path != &key.0 || (*len, *modified) == (key.2, key.3))
+        cache.retain(|(path, _, len, modified), _| {
+            path != &key.0 || (*len, *modified) == (key.2, key.3)
         });
         if !cache.contains_key(&key) {
-            cache.insert(key.clone(), session(&key.0, provider)?);
+            let verify_gpu = !matches!(provider, Provider::Cpu | Provider::Burn | Provider::Auto);
+            let prefix = if verify_gpu {
+                let dir = std::env::var_os("HASTUR_AI_PROFILE")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir);
+                std::fs::create_dir_all(&dir)?;
+                Some(dir.join(format!(
+                    "hastur-{}-{}-{}",
+                    std::process::id(),
+                    provider.label(),
+                    name
+                )))
+            } else {
+                None
+            };
+            let session = session_with_profile(&key.0, provider, prefix.as_deref())?;
+            cache.insert(
+                key.clone(),
+                SessionRecord {
+                    session,
+                    verify_gpu,
+                },
+            );
         }
-        let session = cache.get_mut(&key).unwrap();
+        let record = cache.get_mut(&key).unwrap();
         let output = if inputs.len() == 2 {
-            session.run(ort::inputs![
+            record.session.run(ort::inputs![
                 TensorRef::from_array_view(&inputs[0])?,
                 TensorRef::from_array_view(&inputs[1])?
             ])?
         } else {
-            session.run(ort::inputs![TensorRef::from_array_view(&inputs[0])?])?
+            record
+                .session
+                .run(ort::inputs![TensorRef::from_array_view(&inputs[0])?])?
         };
-        output
+        let result: Vec<Output> = output
             .iter()
             .map(|(_, tensor)| {
                 let (shape, data) = tensor.try_extract_tensor::<f32>()?;
@@ -57,15 +171,168 @@ fn run(name: &str, provider: Provider, inputs: &[Array4<f32>]) -> Result<Vec<Out
                 );
                 Ok((shape.to_vec(), data.to_vec()))
             })
-            .collect()
+            .collect::<Result<_>>()?;
+        drop(output);
+        if record.verify_gpu {
+            let profile = PathBuf::from(record.session.end_profiling()?);
+            let data = std::fs::read_to_string(&profile)?;
+            let ep = match provider {
+                Provider::DirectMl => "DmlExecutionProvider",
+                Provider::Cuda => "CUDAExecutionProvider",
+                Provider::CoreMl => "CoreMLExecutionProvider",
+                _ => unreachable!(),
+            };
+            let executed = profile_has_provider(&data, ep);
+            if std::env::var_os("HASTUR_AI_PROFILE").is_none() {
+                let _ = std::fs::remove_file(profile);
+            }
+            ensure!(executed, "{name} did not execute any {ep} GPU kernels");
+            record.verify_gpu = false;
+        }
+        Ok(result)
     });
-    if std::env::var_os("ASTRA_AI_TIMINGS").is_some() {
+    if std::env::var_os("HASTUR_AI_TIMINGS").is_some()
+        || std::env::var_os("ASTRA_AI_TIMINGS").is_some()
+    {
         eprintln!(
-            "ONNX {name}: {:.2} ms",
+            "{} {name}: {:.2} ms",
+            provider.label(),
             start.elapsed().as_secs_f64() * 1000.
         );
     }
     result
+}
+fn run(
+    name: &str,
+    provider: Provider,
+    inputs: &[Array4<f32>],
+    status: &mut dyn FnMut(AiStatus),
+) -> Result<Vec<Output>> {
+    if TRACING.with(Cell::get) {
+        MODEL_TRACE.with(|trace| {
+            let mut trace = trace.borrow_mut();
+            if trace.len() == 128 {
+                trace.remove(0);
+            }
+            trace.push(name.into());
+        });
+    }
+    let (stage, progress) = model_stage(name);
+    status(AiStatus::new(
+        stage,
+        format!("Loading/running {name}"),
+        Some(provider),
+        progress,
+    ));
+    #[cfg(astra_burn_models)]
+    if provider == Provider::Burn {
+        record_used(provider);
+        return crate::burn_inference::run(name, inputs);
+    }
+    #[cfg(not(astra_burn_models))]
+    if provider == Provider::Burn {
+        bail!("Burn models are not included in this build. Install AI models and rebuild.");
+    }
+    if provider != Provider::Auto {
+        let result = run_ort(name, provider, inputs)?;
+        record_used(provider);
+        return Ok(result);
+    }
+    let path = model_path(name);
+    let meta = std::fs::metadata(&path)?;
+    let key = (path, Provider::Auto, meta.len(), meta.modified()?);
+    let choice = AUTO.with(|cache| cache.borrow().get(&key).cloned());
+    if let Some((selected, reason)) = choice {
+        if selected == Provider::Cpu && !reason.is_empty() {
+            FALLBACKS.with(|f| {
+                let mut f = f.borrow_mut();
+                if !f.contains(&reason) {
+                    f.push(reason.clone());
+                }
+            });
+        }
+        match run_ort(name, selected, inputs) {
+            Ok(output) => {
+                record_used(selected);
+                status(AiStatus::new(stage, reason, Some(selected), progress));
+                return Ok(output);
+            }
+            Err(error) if selected != Provider::Cpu => {
+                let reason = format!("{name}: GPU error; CPU fallback ({error:#})");
+                AUTO.with(|cache| {
+                    cache
+                        .borrow_mut()
+                        .insert(key.clone(), (Provider::Cpu, reason.clone()));
+                });
+                FALLBACKS.with(|f| f.borrow_mut().push(reason.clone()));
+                status(AiStatus::new(
+                    "Using CPU fallback",
+                    reason,
+                    Some(Provider::Cpu),
+                    progress,
+                ));
+                SESSIONS.with(|cache| {
+                    cache
+                        .borrow_mut()
+                        .retain(|(p, provider, _, _), _| p != &key.0 || *provider == Provider::Cpu)
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        status(AiStatus::new(
+            "Qualifying GPU output",
+            format!("Comparing {name} with CPU on this portrait"),
+            None,
+            progress,
+        ));
+        let reference = run_ort(name, Provider::Cpu, inputs)?;
+        let candidate = gpu_candidate();
+        let gpu = run_ort(name, candidate, inputs);
+        let (selected, reason, output) = match gpu {
+            Ok(output) if output_agreement(&reference, &output) => (
+                candidate,
+                format!(
+                    "{} GPU kernels verified; output agrees with CPU",
+                    candidate.label()
+                ),
+                output,
+            ),
+            Ok(_) => (
+                Provider::Cpu,
+                format!("{name}: GPU output differs from CPU; CPU fallback"),
+                reference,
+            ),
+            Err(error) => (
+                Provider::Cpu,
+                format!("{name}: CPU fallback ({error:#})"),
+                reference,
+            ),
+        };
+        AUTO.with(|cache| {
+            cache
+                .borrow_mut()
+                .retain(|(p, _, len, time), _| p != &key.0 || (*len, *time) == (key.2, key.3));
+            cache
+                .borrow_mut()
+                .insert(key.clone(), (selected, reason.clone()));
+        });
+        // Qualification's temporary reference session need not remain resident.
+        SESSIONS.with(|cache| {
+            cache
+                .borrow_mut()
+                .retain(|(p, provider, _, _), _| p != &key.0 || *provider == selected)
+        });
+        if selected == Provider::Cpu {
+            FALLBACKS.with(|f| f.borrow_mut().push(reason.clone()));
+        }
+        record_used(selected);
+        status(AiStatus::new(stage, reason, Some(selected), progress));
+        return Ok(output);
+    }
+    let output = run_ort(name, Provider::Cpu, inputs)?;
+    record_used(Provider::Cpu);
+    Ok(output)
 }
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x.clamp(-80.0, 80.0)).exp())
@@ -149,13 +416,19 @@ fn nms(mut detections: Vec<Detection>) -> Vec<Detection> {
     }
     output
 }
-fn detect(image: &RgbaImage, provider: Provider, tile: [f32; 4]) -> Result<Vec<Detection>> {
+fn detect(
+    image: &RgbaImage,
+    provider: Provider,
+    tile: [f32; 4],
+    status: &mut dyn FnMut(AiStatus),
+) -> Result<Vec<Detection>> {
     let side = tile[2].max(tile[3]);
     let rect = [tile[0] + tile[2] * 0.5, tile[1] + tile[3] * 0.5, side, side];
     let out = run(
         "face_detection_short_range.onnx",
         provider,
         &[blob(image, 128, rect, 0.0, true)],
+        status,
     )?;
     ensure!(
         out.len() == 2 && out[0].1.len() == 896 * 16 && out[1].1.len() == 896,
@@ -197,7 +470,12 @@ fn detect(image: &RgbaImage, provider: Provider, tile: [f32; 4]) -> Result<Vec<D
     }
     Ok(nms(found))
 }
-fn mesh(image: &RgbaImage, d: &Detection, provider: Provider) -> Result<Option<FaceMesh>> {
+fn mesh(
+    image: &RgbaImage,
+    d: &Detection,
+    provider: Provider,
+    status: &mut dyn FnMut(AiStatus),
+) -> Result<Option<FaceMesh>> {
     let v = d.values;
     let side = v[2].max(v[3]) * 1.5;
     let angle = (v[7] - v[5]).atan2(v[6] - v[4]);
@@ -205,6 +483,7 @@ fn mesh(image: &RgbaImage, d: &Detection, provider: Provider) -> Result<Option<F
         "face_landmarker_Nx3x256x256.onnx",
         provider,
         &[blob(image, 256, [v[0], v[1], side, side], angle, false)],
+        status,
     )?;
     ensure!(
         out.len() == 2 && out[0].1.len() == 478 * 3 && !out[1].1.is_empty(),
@@ -507,16 +786,28 @@ fn masks(image: &RgbaImage, faces: Vec<FaceMesh>) -> Segmentation {
     seg
 }
 
-fn neural(image: &RgbaImage, seg: &mut Segmentation, provider: Provider) -> Result<()> {
+fn neural(
+    image: &RgbaImage,
+    seg: &mut Segmentation,
+    provider: Provider,
+    demand: PortraitDemand,
+    status: &mut dyn FnMut(AiStatus),
+) -> Result<()> {
     let n = (seg.width * seg.height) as usize;
-    seg.neural_blend = vec![[0.5; 3]; n].into();
-    seg.repair_delta = vec![[0.0; 3]; n].into();
-    seg.blemish = vec![0.0; n].into();
-    let (blends, repairs, blemishes) = (
-        &mut seg.neural_blend[..],
-        &mut seg.repair_delta[..],
-        &mut seg.blemish[..],
-    );
+    // User masks control the final blend. Model-space lesion repair always uses
+    // the original face protection, as it does in a fresh full analysis.
+    let repair_skin = if demand.blemishes && seg.custom_skin {
+        masks(image, seg.faces.clone()).skin
+    } else {
+        seg.skin.clone()
+    };
+    if demand.skin {
+        seg.neural_blend = vec![[0.5; 3]; n].into();
+    }
+    if demand.blemishes {
+        seg.repair_delta = vec![[0.0; 3]; n].into();
+        seg.blemish = vec![0.0; n].into();
+    }
     for face in &seg.faces {
         let w = image.width() as f32;
         let h = image.height() as f32;
@@ -531,91 +822,112 @@ fn neural(image: &RgbaImage, seg: &mut Segmentation, provider: Provider) -> Resu
             right - left,
             bottom - top,
         ];
-        let generator = run(
-            "retouch_generator.onnx",
-            provider,
-            &[blob(image, 512, rect, 0.0, true)],
-        )?;
-        ensure!(
-            generator[0].0 == [1, 3, 512, 512],
-            "Unexpected neural blend output"
-        );
-        let detection = run(
-            "local_detection.onnx",
-            provider,
-            &[blob(image, 768, rect, 0.0, true)],
-        )?;
-        ensure!(
-            detection[0].0 == [1, 1, 768, 768],
-            "Unexpected blemish detection output"
-        );
-        let lesion: Vec<f32> = detection[0]
-            .1
-            .iter()
-            .map(|&v| {
-                let p = sigmoid(v);
-                if p >= 0.5 {
-                    1.0
-                } else if p >= 0.35 {
-                    p
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-        let mut input = blob(image, 576, rect, 0.0, true);
-        let mut valid = Array4::ones((1, 1, 576, 576));
-        for y in 0..576 {
-            for x in 0..576 {
-                let u = (x as f32 + 0.5) / 576.0;
-                let v = (y as f32 + 0.5) / 576.0;
-                let skin = sample_channel(
-                    &seg.skin,
-                    seg.width,
-                    seg.height,
-                    (left + u * rect[2]) / w,
-                    (top + v * rect[3]) / h,
-                );
-                let missing = sample_channel(&lesion, 768, 768, u, v) * skin;
-                valid[[0, 0, y, x]] = 1.0 - missing;
-                for c in 0..3 {
-                    input[[0, c, y, x]] *= 1.0 - missing;
+        let generator = if demand.skin {
+            let output = run(
+                "retouch_generator.onnx",
+                provider,
+                &[blob(image, 512, rect, 0.0, true)],
+                status,
+            )?;
+            ensure!(
+                output[0].0 == [1, 3, 512, 512],
+                "Unexpected neural blend output"
+            );
+            Some(output)
+        } else {
+            None
+        };
+        let repair = if demand.blemishes {
+            let detection = run(
+                "local_detection.onnx",
+                provider,
+                &[blob(image, 768, rect, 0.0, true)],
+                status,
+            )?;
+            ensure!(
+                detection[0].0 == [1, 1, 768, 768],
+                "Unexpected blemish detection output"
+            );
+            let lesion: Vec<f32> = detection[0]
+                .1
+                .iter()
+                .map(|&v| {
+                    let p = sigmoid(v);
+                    if p >= 0.5 {
+                        1.0
+                    } else if p >= 0.35 {
+                        p
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            let mut input = blob(image, 576, rect, 0.0, true);
+            let mut valid = Array4::ones((1, 1, 576, 576));
+            for y in 0..576 {
+                for x in 0..576 {
+                    let u = (x as f32 + 0.5) / 576.0;
+                    let v = (y as f32 + 0.5) / 576.0;
+                    let skin = sample_channel(
+                        &repair_skin,
+                        seg.width,
+                        seg.height,
+                        (left + u * rect[2]) / w,
+                        (top + v * rect[3]) / h,
+                    );
+                    let missing = sample_channel(&lesion, 768, 768, u, v) * skin;
+                    valid[[0, 0, y, x]] = 1.0 - missing;
+                    for c in 0..3 {
+                        input[[0, c, y, x]] *= 1.0 - missing;
+                    }
                 }
             }
-        }
-        let inpaint = run("local_inpainting.onnx", provider, &[input, valid])?;
-        ensure!(
-            inpaint[0].0 == [1, 3, 576, 576],
-            "Unexpected blemish inpainting output"
-        );
+            let inpaint = run("local_inpainting.onnx", provider, &[input, valid], status)?;
+            ensure!(
+                inpaint[0].0 == [1, 3, 576, 576],
+                "Unexpected blemish inpainting output"
+            );
+            Some((lesion, inpaint))
+        } else {
+            None
+        };
         for y in top.floor() as u32..bottom.ceil().min(h) as u32 {
             for x in left.floor() as u32..right.ceil().min(w) as u32 {
                 let i = (y * seg.width + x) as usize;
                 let u = (x as f32 + 0.5 - left) / rect[2];
                 let v = (y as f32 + 0.5 - top) / rect[3];
                 let border = (u.min(1.0 - u).min(v.min(1.0 - v)) / 0.045).clamp(0.0, 1.0);
-                let missing = sample_channel(&lesion, 768, 768, u, v) * seg.skin[i] * border;
-                blemishes[i] = blemishes[i].max(missing);
+                let missing = repair.as_ref().map(|(lesion, _)| {
+                    sample_channel(lesion, 768, 768, u, v) * repair_skin[i] * border
+                });
+                if let Some(missing) = missing {
+                    seg.blemish[i] = seg.blemish[i].max(missing);
+                }
                 for c in 0..3 {
-                    let blend = sample_channel(
-                        &generator[0].1[c * 512 * 512..(c + 1) * 512 * 512],
-                        512,
-                        512,
-                        u,
-                        v,
-                    )
-                    .clamp(0.0, 1.0);
-                    blends[i][c] = 0.5 + (blend - 0.5) * border;
-                    let replacement = (sample_channel(
-                        &inpaint[0].1[c * 576 * 576..(c + 1) * 576 * 576],
-                        576,
-                        576,
-                        u,
-                        v,
-                    ) + 1.0)
-                        * 0.5;
-                    repairs[i][c] =
-                        (replacement - image.get_pixel(x, y)[c] as f32 / 255.0) * missing;
+                    if let Some(generator) = &generator {
+                        let blend = sample_channel(
+                            &generator[0].1[c * 512 * 512..(c + 1) * 512 * 512],
+                            512,
+                            512,
+                            u,
+                            v,
+                        )
+                        .clamp(0.0, 1.0);
+                        seg.neural_blend[i][c] = 0.5 + (blend - 0.5) * border;
+                    }
+                    if let Some((_, inpaint)) = &repair {
+                        let replacement = (sample_channel(
+                            &inpaint[0].1[c * 576 * 576..(c + 1) * 576 * 576],
+                            576,
+                            576,
+                            u,
+                            v,
+                        ) + 1.0)
+                            * 0.5;
+                        seg.repair_delta[i][c] = (replacement
+                            - image.get_pixel(x, y)[c] as f32 / 255.0)
+                            * missing.unwrap_or(0.0);
+                    }
                 }
             }
         }
@@ -626,49 +938,173 @@ fn neural(image: &RgbaImage, seg: &mut Segmentation, provider: Provider) -> Resu
 pub fn analyze_portrait(
     image: &RgbaImage,
     provider: Provider,
-    mut stage: impl FnMut(Segmentation),
+    stage: impl FnMut(Segmentation),
 ) -> Result<Segmentation> {
+    analyze_portrait_with_status(image, provider, stage, |_| {})
+}
+pub fn analyze_portrait_with_status(
+    image: &RgbaImage,
+    provider: Provider,
+    stage: impl FnMut(Segmentation),
+    status: impl FnMut(AiStatus),
+) -> Result<Segmentation> {
+    analyze_portrait_demand_with_status(image, provider, PortraitDemand::ALL, None, stage, status)
+}
+
+/// Expand stored rectangles by exact native-pixel copies, preserving existing maps.
+fn dense_maps(base: &Segmentation) -> Segmentation {
+    let Some(crop) = base.map_crop else {
+        return base.clone();
+    };
+    fn expand<T: Copy>(
+        map: &crate::shared::SharedVec<T>,
+        base: &Segmentation,
+        crop: crate::engine::Crop,
+        neutral: T,
+    ) -> crate::shared::SharedVec<T> {
+        let n = (base.width * base.height) as usize;
+        if map.is_empty() || map.len() == n {
+            return map.clone();
+        }
+        let mut data = vec![neutral; n];
+        if map.len() == (crop.width * crop.height) as usize {
+            for y in 0..crop.height {
+                let from = (y * crop.width) as usize;
+                let to = ((crop.y + y) * base.width + crop.x) as usize;
+                data[to..to + crop.width as usize]
+                    .copy_from_slice(&map[from..from + crop.width as usize]);
+            }
+        }
+        data.into()
+    }
+    let mut seg = base.clone();
+    for map in [
+        &mut seg.skin,
+        &mut seg.teeth,
+        &mut seg.eyes,
+        &mut seg.background,
+        &mut seg.under_eyes,
+        &mut seg.forehead,
+        &mut seg.laugh_lines,
+        &mut seg.contour,
+        &mut seg.highlight,
+        &mut seg.blemish,
+    ] {
+        *map = expand(map, base, crop, 0.0);
+    }
+    seg.neural_blend = expand(&seg.neural_blend, base, crop, [0.5; 3]);
+    seg.repair_delta = expand(&seg.repair_delta, base, crop, [0.0; 3]);
+    seg.map_crop = None;
+    seg
+}
+
+pub fn analyze_portrait_demand_with_status(
+    image: &RgbaImage,
+    provider: Provider,
+    demand: PortraitDemand,
+    base: Option<&Segmentation>,
+    mut stage: impl FnMut(Segmentation),
+    mut status: impl FnMut(AiStatus),
+) -> Result<Segmentation> {
+    let demand = demand.normalized();
+    if demand.is_empty() {
+        return Ok(base.cloned().unwrap_or_default());
+    }
+    let base =
+        base.filter(|seg| (seg.width, seg.height) == image.dimensions() && seg.prepared.geometry);
+    if let Some(seg) = base.filter(|seg| seg.prepared.contains(demand)) {
+        return Ok(seg.clone());
+    }
+    REQUESTED.with(|requested| {
+        if *requested.borrow() != Some(provider) {
+            release_idle_resources();
+            *requested.borrow_mut() = Some(provider);
+        }
+    });
+    USED.with(|used| used.borrow_mut().clear());
+    FALLBACKS.with(|f| f.borrow_mut().clear());
     if image.width() == 0 || image.height() == 0 {
         bail!("Cannot analyze an empty image");
     }
-    let (w, h) = (image.width() as f32, image.height() as f32);
-    let mut detections = detect(image, provider, [0.0, 0.0, w, h])?;
-    // Overlapping crops make short-range BlazeFace useful for smaller faces in group portraits.
-    for y in [0.0, h * 0.4] {
-        for x in [0.0, w * 0.4] {
-            detections.extend(detect(image, provider, [x, y, w * 0.6, h * 0.6])?);
+    let mut seg = if let Some(base) = base {
+        dense_maps(base)
+    } else {
+        let (w, h) = (image.width() as f32, image.height() as f32);
+        let mut detections = detect(image, provider, [0.0, 0.0, w, h], &mut status)?;
+        // Overlapping crops make short-range BlazeFace useful for smaller faces in group portraits.
+        for y in [0.0, h * 0.4] {
+            for x in [0.0, w * 0.4] {
+                detections.extend(detect(
+                    image,
+                    provider,
+                    [x, y, w * 0.6, h * 0.6],
+                    &mut status,
+                )?);
+            }
         }
-    }
-    let detections = nms(detections);
-    let mut faces = vec![];
-    for d in detections {
-        if let Some(face) = mesh(image, &d, provider)? {
-            faces.push(face);
+        let detections = nms(detections);
+        let mut faces = vec![];
+        for d in detections {
+            if let Some(face) = mesh(image, &d, provider, &mut status)? {
+                faces.push(face);
+            }
         }
-    }
-    let mut seg = masks(image, faces);
+        let mut seg = masks(image, faces);
+        seg.prepared = PortraitDemand::GEOMETRY;
+        seg
+    };
     if seg.faces.is_empty() {
+        seg.prepared = PortraitDemand::ALL;
         seg.status = format!(
             "{} · no confident face found; use manual tools",
-            provider.label()
+            backend_label(provider)
         );
+        let fallback = FALLBACKS.with(|f| f.borrow().join("; "));
+        if !fallback.is_empty() {
+            seg.status.push_str(&format!(" · {fallback}"));
+        }
+        status(AiStatus::new(
+            "Portrait analysis finished",
+            &seg.status,
+            None,
+            1.0,
+        ));
         seg.compact_generated_maps();
         return Ok(seg);
     }
     seg.status = format!(
         "{} · {} face(s), 478 landmarks · preparing neural retouch",
-        provider.label(),
+        backend_label(provider),
         seg.faces.len()
     );
-    let mut partial = seg.clone();
-    partial.compact_generated_maps();
-    stage(partial);
-    neural(image, &mut seg, provider)?;
+    let missing = demand.without(seg.prepared);
+    if missing.skin || missing.blemishes {
+        let mut partial = seg.clone();
+        partial.compact_generated_maps();
+        stage(partial);
+        neural(image, &mut seg, provider, missing, &mut status)?;
+    }
+    seg.prepared = seg.prepared.union(missing);
     seg.status = format!(
-        "{} · {} face(s) · mesh, neural skin & blemish repair ready",
-        provider.label(),
-        seg.faces.len()
+        "{} · {} face(s) · mesh{}{} ready",
+        backend_label(provider),
+        seg.faces.len(),
+        if seg.prepared.skin {
+            ", neural skin"
+        } else {
+            ""
+        },
+        if seg.prepared.blemishes {
+            " & blemish repair"
+        } else {
+            ""
+        },
     );
+    let fallback = FALLBACKS.with(|f| f.borrow().join("; "));
+    if !fallback.is_empty() {
+        seg.status.push_str(&format!(" · {fallback}"));
+    }
+    status(AiStatus::new("Portrait AI ready", &seg.status, None, 1.0));
     seg.compact_generated_maps();
     Ok(seg)
 }
@@ -676,6 +1112,30 @@ pub fn analyze_portrait(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn qualification_rejects_wrong_shapes_nonfinite_and_large_output_changes() {
+        let cpu = vec![(vec![1, 3], vec![0.2, -100.0, 250.0])];
+        let close = vec![(vec![1, 3], vec![0.20001, -100.001, 250.001])];
+        assert!(output_agreement(&cpu, &close));
+        for output in [
+            vec![(vec![3, 1], close[0].1.clone())],
+            vec![(vec![1, 3], vec![0.2, f32::NAN, 250.0])],
+            vec![(vec![1, 3], vec![0.4, -100.0, 250.0])],
+        ] {
+            assert!(!output_agreement(&cpu, &output));
+        }
+    }
+    #[test]
+    fn gpu_claim_requires_profile_kernel_provider_field() {
+        assert!(profile_has_provider(
+            r#"[{"args":{"provider" : "DmlExecutionProvider"}}]"#,
+            "DmlExecutionProvider"
+        ));
+        assert!(!profile_has_provider(
+            r#"[{"name":"DmlExecutionProvider","args":{"provider":"CPUExecutionProvider"}}]"#,
+            "DmlExecutionProvider"
+        ));
+    }
     #[test]
     fn weighted_nms_preserves_multiple_faces_and_blends_duplicate_boxes() {
         let mut values = [0.0; 16];

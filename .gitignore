@@ -1,17 +1,42 @@
+# -- Build artifacts ----------------------------------------------------------
 /target/
 /output/
+
+# -- Sensitive example / demo images ------------------------------------------
+/example-img/
+/assets/demo-portrait.png
+/assets/demo-prompt.txt
+
+# -- AI models (binary weights, packages, archives) ---------------------------
 /models/*.onnx
-/models/burn/*.bpk
+/models/*.pt
+/models/*.pth
 /models/*.dll
 /models/*.so*
 /models/*.dylib
-/astra.log
-
-/.ai-tools/
-/models/*.pt
-/models/*.pth
 /models/*.zip
 /models/*.nupkg
+/models/*.bpk
+/models/burn/
 /models/cpu/
 /models/directml/
+/models/retouch-training.json
+
+# -- Paired-training & sensitive scripts --------------------------------------
+/scripts/portrait-validation-sources.md
+/scripts/third_party/
+/scripts/requirements-paired-training.txt
+
+# -- Runtime caches / local tool dirs -----------------------------------------
 /.astra-cache/
+/.hastur-cache/
+/.ai-tools/
+/.ai-gpu-tools/
+
+# -- Logs ---------------------------------------------------------------------
+*.log
+
+# -- Python bytecode (all subdirectories) -------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo

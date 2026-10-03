@@ -1,5 +1,5 @@
 //! Measures source-profile differences between preview and original on actual input photographs.
-use astra_retouch::{
+use hastur_retouch::{
     color::{ColorSettings, PreparedColor, ReferenceProfile},
     engine,
 };

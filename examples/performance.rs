@@ -1,6 +1,6 @@
 //! Reproducible end-to-end timings and pixel baselines. Run with --reference before optimization.
 use anyhow::{Result, ensure};
-use astra_retouch::{
+use hastur_retouch::{
     cleanup::CloneStamp,
     engine::{self, Background, Edit, ExportOptions, ExportSize, Settings, Stroke, Target},
     geometry::WarpStroke,
@@ -86,6 +86,7 @@ fn main() -> Result<()> {
             center,
             radius: 0.012,
             erase: false,
+            strength: 100.0,
             softness: 0.65,
         });
         clone.clones.push(CloneStamp {
@@ -107,6 +108,7 @@ fn main() -> Result<()> {
             center,
             radius: 0.02,
             erase: i % 3 == 0,
+            strength: 100.0,
             softness: 0.7,
         });
     }

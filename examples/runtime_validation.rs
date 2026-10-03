@@ -1,6 +1,6 @@
 //! Isolated-process release AI timing, peak working set, and native-resolution crops.
 use anyhow::{Result, ensure};
-use astra_retouch::{
+use hastur_retouch::{
     engine::{self, Edit},
     model::{self, Provider},
 };
@@ -118,7 +118,7 @@ fn registered_mask(seg: &engine::Segmentation, data: &[f32], u: f32, v: f32) -> 
 }
 fn detail_crops(
     image: &RgbaImage,
-    face: &astra_retouch::geometry::FaceMesh,
+    face: &hastur_retouch::geometry::FaceMesh,
     output: &std::path::Path,
     name: &str,
 ) -> Result<()> {

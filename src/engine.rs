@@ -18,6 +18,8 @@ use std::{
 
 #[path = "tiles.rs"]
 mod tiles;
+#[path = "viewport.rs"]
+mod viewport;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -52,6 +54,8 @@ pub struct Settings {
     pub vignette: f32,
     pub background: Background,
     pub background_blur: f32,
+    /// Blend amount for background replacement and blur; retained across layer toggles.
+    pub background_opacity: f32,
     pub background_color: [u8; 3],
 }
 
@@ -88,6 +92,7 @@ impl Default for Settings {
             vignette: 0.0,
             background: Background::Original,
             background_blur: 35.0,
+            background_opacity: 100.0,
             background_color: [238, 238, 238],
         }
     }
@@ -208,6 +213,7 @@ pub enum Target {
     Liquify,
     Clone,
     Patch,
+    LayerMask,
 }
 
 impl Target {
@@ -222,6 +228,7 @@ impl Target {
             Self::Liquify => "Liquify",
             Self::Clone => "Clone stamp",
             Self::Patch => "Patch",
+            Self::LayerMask => "Layer mask",
         }
     }
 }
@@ -232,6 +239,9 @@ pub struct Stroke {
     pub center: [f32; 2],
     pub radius: f32,
     pub erase: bool,
+    /// Opacity of this healing stroke. Older sessions used only the global healing control.
+    #[serde(default = "full_stroke_strength")]
+    pub strength: f32,
     #[serde(default = "legacy_softness")]
     pub softness: f32,
 }
@@ -239,11 +249,16 @@ pub struct Stroke {
 fn legacy_softness() -> f32 {
     1.0
 }
+fn full_stroke_strength() -> f32 {
+    100.0
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Edit {
     pub settings: Settings,
+    pub layers: crate::layers::LayerControls,
+    pub stack: crate::layer_stack::LayerStack,
     pub strokes: SharedVec<Stroke>,
     pub preset: Option<String>,
     pub warps: SharedVec<crate::geometry::WarpStroke>,
@@ -323,6 +338,9 @@ pub fn presets() -> Vec<Preset> {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Segmentation {
+    /// Generated-map readiness is runtime-only: RON does not retain neural arrays.
+    #[serde(skip)]
+    pub prepared: crate::nullstate::PortraitDemand,
     pub width: u32,
     pub height: u32,
     /// Generated face maps may store only their non-neutral rectangle. Explicit masks stay full size.
@@ -472,6 +490,7 @@ impl Segmentation {
         Self {
             width,
             height,
+            prepared: self.prepared,
             skin: resize(&self.skin),
             teeth: resize(&self.teeth),
             eyes: resize(&self.eyes),
@@ -518,6 +537,32 @@ pub struct Photo {
     pub original: Arc<RgbaImage>,
     pub preview: Arc<RgbaImage>,
     pub analysis: Analysis,
+    /// Staged photos contain a bounded thumbnail until opened for editing.
+    pub resident: bool,
+    pub source_dimensions: (u32, u32),
+    pub thumbnail: Arc<RgbaImage>,
+}
+
+impl Photo {
+    pub fn dimensions(&self) -> (u32, u32) {
+        self.source_dimensions
+    }
+
+    pub fn release_pixels(&mut self) {
+        if self.path.is_some() {
+            self.original = self.thumbnail.clone();
+            self.preview = self.thumbnail.clone();
+            self.resident = false;
+        }
+    }
+
+    pub fn open_native(&self) -> Result<Self> {
+        if self.resident {
+            Ok(self.clone())
+        } else {
+            load_photo(self.path.as_deref().context("Missing original path")?)
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -609,9 +654,21 @@ pub fn load_photo(path: &Path) -> Result<Photo> {
     let mut decoded = DynamicImage::from_decoder(decoder)?;
     decoded.apply_orientation(orientation);
     let mut original = decoded.into_rgba8();
+    convert_to_srgb(&mut original, icc.as_deref())?;
+    Ok(photo_from_image(
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into(),
+        Some(path.to_path_buf()),
+        original,
+    ))
+}
+
+pub(crate) fn convert_to_srgb(original: &mut RgbaImage, icc: Option<&[u8]>) -> Result<()> {
     if let Some(icc) = icc {
         let profile =
-            moxcms::ColorProfile::new_from_slice(&icc).context("Invalid embedded ICC profile")?;
+            moxcms::ColorProfile::new_from_slice(icc).context("Invalid embedded ICC profile")?;
         if profile.color_space != moxcms::DataColorSpace::Rgb {
             bail!("Convert this non-RGB ICC image to sRGB before importing");
         }
@@ -626,17 +683,10 @@ pub fn load_photo(path: &Path) -> Result<Photo> {
         let mut converted = vec![0; original.as_raw().len()];
         transform.transform(original.as_raw(), &mut converted)?;
         let (oriented_width, oriented_height) = original.dimensions();
-        original = RgbaImage::from_raw(oriented_width, oriented_height, converted)
+        *original = RgbaImage::from_raw(oriented_width, oriented_height, converted)
             .context("Invalid oriented ICC image dimensions")?;
     }
-    Ok(photo_from_image(
-        path.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into(),
-        Some(path.to_path_buf()),
-        original,
-    ))
+    Ok(())
 }
 
 pub fn photo_from_image(name: String, path: Option<PathBuf>, original: RgbaImage) -> Photo {
@@ -654,12 +704,22 @@ pub fn photo_from_image(name: String, path: Option<PathBuf>, original: RgbaImage
         original.clone()
     };
     let analysis = analyze(&preview);
+    let (tw, th) = crate::assets::thumbnail_dimensions(preview.width(), preview.height());
+    let thumbnail = Arc::new(image::imageops::resize(
+        preview.as_ref(),
+        tw,
+        th,
+        image::imageops::FilterType::Lanczos3,
+    ));
     Photo {
         name,
         path,
-        original,
+        original: original.clone(),
         preview,
         analysis,
+        resident: true,
+        source_dimensions: original.dimensions(),
+        thumbnail,
     }
 }
 
@@ -685,7 +745,7 @@ pub fn linear_to_srgb(v: f32) -> f32 {
 }
 /// Exact 8-bit output quantization. A small coarse table selects at most one threshold;
 /// thresholds are found using the same float transfer/rounding as the full calculation.
-fn linear_output_byte(value: f32) -> u8 {
+pub(crate) fn linear_output_byte(value: f32) -> u8 {
     struct Quantizer {
         buckets: [u8; 16_384],
         thresholds: [f32; 255],
@@ -1113,8 +1173,7 @@ fn under_eye_shadow_lift(
         .iter()
         .flat_map(|face| crate::model::portrait::eye_regions(face, w, h))
         .map(|eye| {
-            let mut sum = 0.0;
-            let mut count = 0;
+            let mut cheek_samples = Vec::with_capacity(9);
             for below in [0.78, 0.98, 1.18] {
                 for across in [-0.2, 0.0, 0.2] {
                     let x = eye.lower[0]
@@ -1135,11 +1194,10 @@ fn under_eye_shadow_lift(
                     if masks.value(index, 3) > 0.18 {
                         continue;
                     }
-                    sum += lum_half(&low[index]);
-                    count += 1;
+                    cheek_samples.push(lum_half(&low[index]));
                 }
             }
-            if count == 0 {
+            if cheek_samples.is_empty() {
                 let x = (eye.lower[0] + eye.down[0] * eye.width).round() as u32;
                 let y = (eye.lower[1] + eye.down[1] * eye.width).round() as u32;
                 let index = (y.min(h - 1) * w + x.min(w - 1)) as usize;
@@ -1148,9 +1206,15 @@ fn under_eye_shadow_lift(
                     luma: lum_half(&low[index]),
                 }
             } else {
+                // A few dark pores or shadows can pull an average below the
+                // actual cheek tone. Use the central/upper samples without
+                // following a single bright highlight.
+                cheek_samples.sort_by(f32::total_cmp);
+                let middle = cheek_samples[cheek_samples.len() / 2];
+                let upper = cheek_samples[cheek_samples.len() * 3 / 4];
                 UnderEyeReference {
                     eye,
-                    luma: sum / count as f32,
+                    luma: (middle + upper) * 0.5,
                 }
             }
         })
@@ -1175,7 +1239,7 @@ fn under_eye_shadow_lift(
                     distance(a).total_cmp(&distance(b))
                 })
                 .unwrap();
-            let shadow = (reference.luma - lum_half(&low[i]) - 0.012).clamp(0.0, 0.12);
+            let shadow = (reference.luma - lum_half(&low[i]) - 0.008).clamp(0.0, 0.12);
             shadow * region * 0.9
         })
         .collect()
@@ -1231,6 +1295,8 @@ pub fn mask_overlay_region(
     target: Target,
     crop: Crop,
 ) -> RgbaImage {
+    let effective_layers = edit.effective_layers();
+    let edit = effective_layers.as_ref();
     let (w, h) = image.dimensions();
     if crate::geometry::active(edit, seg) {
         let mapping = crate::geometry::Mapping::new(edit, seg, (w, h));
@@ -1342,8 +1408,10 @@ fn check_cancel(cancel: Option<&AtomicBool>) -> Result<()> {
 /// Worker-owned, bounded reuse of immutable source/filter data between slider previews.
 #[derive(Default)]
 pub struct Renderer {
+    stack: crate::stack_render::StackRenderer,
     sources: Vec<SourceBuffers>,
     native_sources: Vec<(Arc<RgbaImage>, tiles::NativeCache)>,
+    viewport: Option<viewport::FrameCache>,
 }
 struct SourceBuffers {
     image: Arc<RgbaImage>,
@@ -1388,6 +1456,11 @@ impl Renderer {
         crop: Crop,
         cancel: Option<&AtomicBool>,
     ) -> Result<RgbaImage> {
+        if !edit.stack.layers.is_empty() {
+            return self.stack.region(image, edit, seg, crop, cancel);
+        }
+        let effective_layers = edit.effective_layers();
+        let edit = effective_layers.as_ref();
         let index = self
             .native_sources
             .iter()
@@ -1424,6 +1497,11 @@ impl Renderer {
         seg: Option<&Arc<Segmentation>>,
         cancel: Option<&AtomicBool>,
     ) -> Result<RgbaImage> {
+        if !edit.stack.layers.is_empty() {
+            return self.stack.render(image, edit, seg, cancel);
+        }
+        let effective_layers = edit.effective_layers();
+        let edit = effective_layers.as_ref();
         // Never retain full-resolution buffers for large exports; previews share at most 160 MiB.
         if image.width() as u64 * image.height() as u64 > 2_100_000 {
             return render_cancellable(image, edit, seg.map(Arc::as_ref), cancel);
@@ -1502,6 +1580,16 @@ pub fn render_cancellable(
     seg: Option<&Segmentation>,
     cancel: Option<&AtomicBool>,
 ) -> Result<RgbaImage> {
+    if !edit.stack.layers.is_empty() {
+        return Renderer::default().render(
+            &Arc::new(image.clone()),
+            edit,
+            seg.map(|s| Arc::new(s.clone())).as_ref(),
+            cancel,
+        );
+    }
+    let effective_layers = edit.effective_layers();
+    let edit = effective_layers.as_ref();
     if u64::from(image.width()) * u64::from(image.height()) > 2_100_000 {
         tiles::render(image, edit, seg, cancel)
     } else {
@@ -1517,6 +1605,17 @@ pub fn render_region(
     crop: Crop,
     cancel: Option<&AtomicBool>,
 ) -> Result<RgbaImage> {
+    if !edit.stack.layers.is_empty() {
+        return Renderer::default().render_region(
+            &Arc::new(image.clone()),
+            edit,
+            seg.map(|s| Arc::new(s.clone())).as_ref(),
+            crop,
+            cancel,
+        );
+    }
+    let effective_layers = edit.effective_layers();
+    let edit = effective_layers.as_ref();
     tiles::render_region(image, edit, seg, crop, cancel)
 }
 fn render_inner(
@@ -1678,7 +1777,7 @@ fn render_inner(
     let local_masks = if let Some(c) = cache.as_mut() {
         let same = c.masks.as_ref().is_some_and(|m| {
             m.targets == targets
-                && m.strokes.same_storage(&edit.strokes)
+                && (m.strokes.same_storage(&edit.strokes) || m.strokes == edit.strokes)
                 && match (&m.seg, shared_seg) {
                     (None, None) => true,
                     (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -1744,18 +1843,41 @@ fn render_inner(
     };
     let healed = if let Some(c) = cache.as_mut() {
         let same = c.cleanup.as_ref().is_some_and(|m| {
-            m.strokes.same_storage(&edit.strokes)
-                && m.clones.same_storage(&edit.clones)
-                && m.patches.same_storage(&edit.patches)
+            (m.strokes.same_storage(&edit.strokes) || m.strokes == edit.strokes)
+                && (m.clones.same_storage(&edit.clones) || m.clones == edit.clones)
+                && (m.patches.same_storage(&edit.patches) || m.patches == edit.patches)
                 && m.healing == s.healing
         });
         if !same {
+            let data = c
+                .cleanup
+                .as_mut()
+                .and_then(|previous| {
+                    let suffix = crate::cleanup::appended_edit(
+                        &previous.strokes,
+                        &previous.clones,
+                        &previous.patches,
+                        previous.healing,
+                        edit,
+                    )?;
+                    let mut data = previous.data.take()?;
+                    crate::cleanup::apply_into(
+                        Arc::make_mut(&mut data).as_mut_slice(),
+                        &linear,
+                        fine.as_ref().map(|f| f.as_slice()),
+                        w,
+                        h,
+                        &suffix,
+                    );
+                    Some(data)
+                })
+                .or_else(make_cleanup);
             c.cleanup = Some(CleanupBuffers {
                 strokes: edit.strokes.clone(),
                 clones: edit.clones.clone(),
                 patches: edit.patches.clone(),
                 healing: s.healing,
-                data: make_cleanup(),
+                data,
             });
         }
         c.cleanup.as_ref().unwrap().data.clone()
@@ -1797,7 +1919,7 @@ fn render_inner(
     Ok(image)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExportSize {
     Original,
     Web,
@@ -1951,6 +2073,8 @@ pub fn export_with_options(
     } = options;
     let (size, png, quality, center) = (*size, *png, *quality, *center);
     check_cancel(cancel.as_deref())?;
+    let native = photo.open_native()?;
+    let photo = &native;
     let rendered = render_cancellable(&photo.original, edit, seg, cancel.as_deref())?;
     let image = resize_export_at(rendered, size, center);
     check_cancel(cancel.as_deref())?;
@@ -2033,7 +2157,7 @@ pub struct History {
 const HISTORY_INSTRUCTION_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn changelog(edit: &Edit) -> String {
-    let effective = edit.settings.effective();
+    let effective = edit.effective_settings();
     let s = &effective;
     let mut result = format!(
         "Skin {} · tone {} · redness {} · auto blemishes {} ({} healing strokes) · under-eyes {} · teeth {} · eyes {} · exposure {:+.2} EV · contrast {} · highlights {} · shadows {} · warmth {} · tint {} · saturation {} · sharpening {} · vignette {} · background {:?}",
@@ -2091,6 +2215,18 @@ pub fn changelog(edit: &Edit) -> String {
             reference.name, s.color.reference_strength
         ));
     }
+    for kind in crate::layers::LayerKind::ALL {
+        let layer = edit.layers.get(kind);
+        if !layer.visible {
+            result.push_str(&format!(" · {} layer hidden", kind.label()));
+        } else if layer.opacity != 100.0 {
+            result.push_str(&format!(
+                " · {} layer opacity {}%",
+                kind.label(),
+                layer.opacity
+            ));
+        }
+    }
     result
 }
 
@@ -2100,7 +2236,7 @@ pub fn export_report(
 ) -> Result<PathBuf> {
     let escape = |s: &str| s.replace('|', "\\|").replace(['\n', '\r'], " ");
     let mut text = String::from(
-        "# Astra Retouch export\n\nOriginal files were preserved. Photo-local masks were not synchronized between subjects.\n\n| Photo | Output | Edits applied | Notes |\n| --- | --- | --- | --- |\n",
+        "# Hastur Retouch export\n\nOriginal files were preserved. Photo-local masks were not synchronized between subjects.\n\n| Photo | Output | Edits applied | Notes |\n| --- | --- | --- | --- |\n",
     );
     for (name, output, edits, notes) in rows {
         text.push_str(&format!(
@@ -2112,7 +2248,7 @@ pub fn export_report(
         ));
     }
     for version in 1..=10_000 {
-        let path = directory.join(format!("Astra-export-v{version}.md"));
+        let path = directory.join(format!("Hastur-export-v{version}.md"));
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
                 file.write_all(text.as_bytes())?;
@@ -2130,6 +2266,12 @@ impl History {
             && a.warps.same_storage(&b.warps)
             && a.clones.same_storage(&b.clones)
             && a.patches.same_storage(&b.patches)
+            && a.stack.layers.len() == b.stack.layers.len()
+            && a.stack
+                .layers
+                .iter()
+                .zip(b.stack.layers.iter())
+                .all(|(a, b)| a.id == b.id && Self::same_action_storage(&a.edit, &b.edit))
     }
     /// Snapshots contain edit instructions, never full-resolution pixels.
     pub fn snapshots(&self) -> (impl Iterator<Item = &Edit>, impl Iterator<Item = &Edit>) {
@@ -2191,14 +2333,22 @@ impl History {
         let mut seen = std::collections::HashSet::new();
         let mut bytes = 0;
         for edit in self.past.iter().chain(self.future.iter()) {
-            bytes += allocation(&edit.strokes, &mut seen);
-            bytes += allocation(&edit.warps, &mut seen);
-            bytes += allocation(&edit.clones, &mut seen);
-            let patch_bytes = allocation(&edit.patches, &mut seen);
-            bytes += patch_bytes;
-            if patch_bytes > 0 {
-                for patch in &edit.patches {
-                    bytes += allocation(&patch.boundary, &mut seen);
+            let edits = std::iter::once(edit)
+                .chain(edit.stack.layers.iter().map(|layer| layer.edit.as_ref()));
+            bytes += allocation(&edit.stack.layers, &mut seen);
+            bytes += edit.stack.solo.as_ref().map_or(0, |solo| {
+                solo.visibility.capacity() * std::mem::size_of::<(u64, bool)>()
+            });
+            for edit in edits {
+                bytes += allocation(&edit.strokes, &mut seen);
+                bytes += allocation(&edit.warps, &mut seen);
+                bytes += allocation(&edit.clones, &mut seen);
+                let patch_bytes = allocation(&edit.patches, &mut seen);
+                bytes += patch_bytes;
+                if patch_bytes > 0 {
+                    for patch in &edit.patches {
+                        bytes += allocation(&patch.boundary, &mut seen);
+                    }
                 }
             }
         }
@@ -2359,9 +2509,10 @@ fn render_pixels(pass: PixelPass<'_>) -> Vec<u8> {
                         },
                     )
                 });
-                let targeted =
-                    (masks[3] * s.under_eyes + forehead * s.forehead + laugh * s.laugh_lines)
-                        / 100.0;
+                let targeted = (masks[3] * s.under_eyes * 0.35
+                    + forehead * s.forehead
+                    + laugh * s.laugh_lines)
+                    / 100.0;
                 let neural = seg
                     .filter(|seg| {
                         !seg.neural_blend.is_empty()
@@ -2371,6 +2522,7 @@ fn render_pixels(pass: PixelPass<'_>) -> Vec<u8> {
                 let repair = seg
                     .filter(|seg| s.blemishes != 0.0 && !seg.repair_delta.is_empty())
                     .map(|seg| sample_seg_rgb(&seg.repair_delta, seg, uv[0], uv[1], 0.0));
+                let before_targeted_luma = lum(&p);
                 for c in 0..3 {
                     if let Some(delta) = repair
                         && delta[c] != 0.0
@@ -2399,6 +2551,17 @@ fn render_pixels(pass: PixelPass<'_>) -> Vec<u8> {
                         low[c] + linear[i][c] - fine[c],
                         skin * s.tone_evenness / 100.0 * 0.65 * (1.0 - edge),
                     );
+                }
+                // Under-eye smoothing should not deepen a shadow when the neural blend
+                // or local blur disagrees with the cheek reference.
+                if s.under_eyes > 0.0 && masks[3] > 0.0 && targeted > 0.0 {
+                    let after = lum(&p);
+                    if after < before_targeted_luma && after > 0.0001 {
+                        let scale = before_targeted_luma / after;
+                        for channel in &mut p[..3] {
+                            *channel *= scale;
+                        }
+                    }
                 }
                 let l = lum(&p);
                 p[0] = lerp(p[0], l + (p[0] - l) * 0.7, skin * s.redness / 100.0 * 0.5);
@@ -2442,7 +2605,7 @@ fn render_pixels(pass: PixelPass<'_>) -> Vec<u8> {
                 }
                 p = color.apply_linear(p);
                 if s.background != Background::Original {
-                    let b = masks[4];
+                    let b = masks[4] * (s.background_opacity / 100.0).clamp(0.0, 1.0);
                     match s.background {
                         Background::Blur => {
                             if let Some(bg) = &background {
@@ -2472,6 +2635,168 @@ fn render_pixels(pass: PixelPass<'_>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_tool_layer_can_restore_original_pixels_in_full_native_and_cached_renders() {
+        use crate::{
+            cleanup::{CloneStamp, PatchStroke},
+            geometry::WarpStroke,
+            layers::LayerKind,
+        };
+        let image = Arc::new(RgbaImage::from_fn(96, 80, |x, y| {
+            let detail = if (x / 5 + y / 7) % 2 == 0 { 0 } else { 30 };
+            let mut p = [150 + (x / 3) as u8, 95 + (y / 4) as u8, 80 + detail, 255];
+            if (x as i32 - 53).pow(2) + (y as i32 - 40).pow(2) < 36 {
+                p = [45, 25, 20, 255];
+            }
+            image::Rgba(p)
+        }));
+        let seg = Arc::new(Segmentation {
+            width: 96,
+            height: 80,
+            skin: vec![1.0; 96 * 80].into(),
+            background: vec![1.0; 96 * 80].into(),
+            ..Default::default()
+        });
+        let crop = Crop {
+            x: 20,
+            y: 16,
+            width: 56,
+            height: 48,
+        };
+        let original_region =
+            image::imageops::crop_imm(image.as_ref(), crop.x, crop.y, crop.width, crop.height)
+                .to_image();
+        for kind in LayerKind::ALL {
+            let mut edit = Edit::default();
+            match kind {
+                LayerKind::Portrait => edit.settings.smoothing = 85.0,
+                LayerKind::Color => edit.settings.exposure = 1.0,
+                LayerKind::Background => {
+                    edit.settings.background = Background::Solid;
+                    edit.settings.background_color = [20, 50, 160];
+                }
+                LayerKind::Liquify => edit.warps.push(WarpStroke {
+                    center: [0.55, 0.5],
+                    delta: [0.15, 0.0],
+                    radius: 0.4,
+                    softness: 0.5,
+                    strength: 100.0,
+                }),
+                LayerKind::SpotHeal => edit.strokes.push(Stroke {
+                    target: Target::Heal,
+                    center: [0.55, 0.5],
+                    radius: 0.15,
+                    erase: false,
+                    strength: 100.0,
+                    softness: 0.6,
+                }),
+                LayerKind::CloneStamp => edit.clones.push(CloneStamp {
+                    center: [0.6, 0.5],
+                    source: [0.2, 0.5],
+                    radius: 0.25,
+                    softness: 0.5,
+                    strength: 100.0,
+                }),
+                LayerKind::Patch => edit.patches.push(PatchStroke {
+                    boundary: vec![[0.4, 0.3], [0.75, 0.3], [0.75, 0.7], [0.4, 0.7]],
+                    offset: [-0.25, 0.0],
+                    softness: 0.4,
+                    strength: 100.0,
+                }),
+            }
+            assert!(kind.has_content(&edit));
+            let enabled = render(&image, &edit, Some(&seg));
+            assert_ne!(
+                &enabled,
+                image.as_ref(),
+                "{} layer must visibly affect this fixture",
+                kind.label()
+            );
+            let mut renderer = Renderer::default();
+            assert_eq!(
+                renderer.render(&image, &edit, Some(&seg), None).unwrap(),
+                enabled
+            );
+            renderer
+                .render_region(&image, &edit, Some(&seg), crop, None)
+                .unwrap();
+            edit.layers.get_mut(kind).visible = false;
+            assert!(kind.has_content(&edit), "Hidden edits are retained");
+            assert_eq!(
+                &render(&image, &edit, Some(&seg)),
+                image.as_ref(),
+                "{}",
+                kind.label()
+            );
+            assert_eq!(
+                render_region(&image, &edit, Some(&seg), crop, None).unwrap(),
+                original_region,
+                "{} native region",
+                kind.label()
+            );
+            assert_eq!(
+                &renderer.render(&image, &edit, Some(&seg), None).unwrap(),
+                image.as_ref(),
+                "{} cached preview",
+                kind.label()
+            );
+            assert_eq!(
+                renderer
+                    .render_region(&image, &edit, Some(&seg), crop, None)
+                    .unwrap(),
+                original_region,
+                "{} cached native region",
+                kind.label()
+            );
+            edit.layers.get_mut(kind).visible = true;
+            edit.layers.get_mut(kind).opacity = 0.0;
+            assert_eq!(&render(&image, &edit, Some(&seg)), image.as_ref());
+            edit.layers.get_mut(kind).opacity = 50.0;
+            let half = render(&image, &edit, Some(&seg));
+            assert_ne!(
+                &half,
+                image.as_ref(),
+                "{} opacity 50 must have an effect",
+                kind.label()
+            );
+            assert_ne!(
+                half,
+                enabled,
+                "{} opacity must attenuate the effect",
+                kind.label()
+            );
+        }
+    }
+
+    #[test]
+    fn background_layer_opacity_blends_replacement_instead_of_changing_blur_radius() {
+        use crate::layers::LayerKind;
+        let image = RgbaImage::from_pixel(8, 8, image::Rgba([100, 120, 140, 255]));
+        let seg = Segmentation {
+            width: 8,
+            height: 8,
+            background: vec![1.0; 64].into(),
+            ..Default::default()
+        };
+        let mut edit = Edit::default();
+        edit.settings.background = Background::Solid;
+        edit.settings.background_color = [200, 180, 160];
+        edit.layers.get_mut(LayerKind::Background).opacity = 50.0;
+        let result = render(&image, &edit, Some(&seg));
+        let expected: [u8; 3] = std::array::from_fn(|c| {
+            linear_output_byte(
+                (linear_byte(image.get_pixel(0, 0)[c])
+                    + linear_byte(edit.settings.background_color[c]))
+                    * 0.5,
+            )
+        });
+        assert_eq!(&result.get_pixel(0, 0).0[..3], &expected);
+        edit.settings.background = Background::Blur;
+        edit.settings.background_blur = 60.0;
+        assert_eq!(edit.effective_settings().background_blur, 60.0);
+        assert_eq!(edit.effective_settings().background_opacity, 50.0);
+    }
+
     #[test]
     fn cached_region_masks_store_only_active_byte_channels() {
         let image = RgbaImage::from_pixel(3, 2, image::Rgba([120, 80, 70, 255]));
@@ -2586,6 +2911,7 @@ mod tests {
             center: [0.5; 2],
             radius: 0.2,
             erase: false,
+            strength: 100.0,
             softness: 0.0,
         };
         edit.strokes.push(stroke.clone());
@@ -2595,6 +2921,7 @@ mod tests {
         );
         edit.strokes.push(Stroke {
             erase: true,
+            strength: 100.0,
             ..stroke
         });
         let overlay = mask_overlay(&image, &edit, None, Target::Teeth);
@@ -2614,6 +2941,7 @@ mod tests {
             radius: 0.2,
             softness: 0.75,
             erase: false,
+            strength: 100.0,
         });
         edit.strokes.push(Stroke {
             target: Target::Teeth,
@@ -2621,6 +2949,7 @@ mod tests {
             radius: 0.08,
             softness: 0.2,
             erase: true,
+            strength: 100.0,
         });
         let region = Crop {
             x: 80,
@@ -2731,6 +3060,7 @@ mod tests {
             center: [0.5, 0.5],
             radius: 0.2,
             erase: false,
+            strength: 100.0,
             softness: 1.0,
         });
         let result = render(&image, &edit, None);
@@ -2780,6 +3110,7 @@ mod tests {
             center: [0.5, 0.5],
             radius: 0.3,
             erase: false,
+            strength: 100.0,
             softness: 1.0,
         });
         let result = render(&image, &edit, None);
@@ -2968,6 +3299,7 @@ mod tests {
                     center: [0.5; 2],
                     radius: 0.1,
                     erase: true,
+                    strength: 100.0,
                     softness: 0.5,
                 }),
                 4 => edit.clones.push(crate::cleanup::CloneStamp {
@@ -3005,6 +3337,84 @@ mod tests {
                 .unwrap_err()
                 .is::<Cancelled>()
         );
+    }
+
+    #[test]
+    fn incremental_cleanup_matches_fresh_preview_and_native_after_overlap_undo_and_reordering() {
+        let image = Arc::new(RgbaImage::from_fn(128, 160, |x, y| {
+            image::Rgba([
+                (x * 7 % 256) as u8,
+                (y * 5 % 256) as u8,
+                ((x + y) * 3 % 256) as u8,
+                230,
+            ])
+        }));
+        let mut edit = Edit::default();
+        let mut renderer = Renderer::default();
+        let crop = Crop {
+            x: 27,
+            y: 31,
+            width: 70,
+            height: 85,
+        };
+        for step in 0..18 {
+            let center = [0.48 + step as f32 * 0.002, 0.5];
+            match step {
+                0..=3 | 10 => edit.strokes.push(Stroke {
+                    target: Target::Heal,
+                    center,
+                    radius: 0.06,
+                    erase: false,
+                    strength: 100.0,
+                    softness: 0.7,
+                }),
+                4..=6 | 11 => edit.clones.push(crate::cleanup::CloneStamp {
+                    center,
+                    source: [0.7, 0.35],
+                    radius: 0.08,
+                    softness: 0.6,
+                    strength: 85.0,
+                }),
+                7..=9 => edit.patches.push(crate::cleanup::PatchStroke {
+                    boundary: vec![[0.43, 0.45], [0.57, 0.45], [0.57, 0.57], [0.43, 0.57]],
+                    offset: [0.1, -0.15],
+                    softness: 0.5,
+                    strength: 70.0,
+                }),
+                12 => {
+                    edit.patches.pop();
+                }
+                13 => edit.strokes[0].center = [0.35, 0.6],
+                14 => edit.settings.healing = 40.0,
+                15 => {
+                    edit.layers
+                        .get_mut(crate::layers::LayerKind::CloneStamp)
+                        .opacity = 30.0
+                }
+                16 => {
+                    edit.layers
+                        .get_mut(crate::layers::LayerKind::SpotHeal)
+                        .visible = false
+                }
+                _ => {
+                    edit.layers
+                        .get_mut(crate::layers::LayerKind::SpotHeal)
+                        .visible = true
+                }
+            }
+            assert_eq!(
+                renderer.render(&image, &edit, None, None).unwrap(),
+                render(&image, &edit, None),
+                "Preview mismatch at step {step}"
+            );
+            assert_eq!(
+                renderer
+                    .render_region(&image, &edit, None, crop, None)
+                    .unwrap(),
+                render_region(&image, &edit, None, crop, None).unwrap(),
+                "Native mismatch at step {step}"
+            );
+        }
     }
 
     #[test]

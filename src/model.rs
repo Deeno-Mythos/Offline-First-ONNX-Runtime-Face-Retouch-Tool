@@ -1,5 +1,5 @@
 //! Local ONNX portrait analysis and optional custom segmentation.
-use crate::engine::Segmentation;
+use crate::{engine::Segmentation, nullstate::PortraitDemand};
 use anyhow::{Result, bail};
 use image::RgbaImage;
 use std::path::Path;
@@ -11,6 +11,7 @@ pub enum Kind {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Provider {
+    Auto,
     Cpu,
     Burn,
     DirectMl,
@@ -20,6 +21,7 @@ pub enum Provider {
 impl Provider {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Auto => "Auto · GPU when qualified",
             Self::Cpu => "CPU",
             Self::Burn => "Burn CPU",
             Self::DirectMl => "DirectML",
@@ -29,6 +31,30 @@ impl Provider {
     }
 }
 pub const AVAILABLE: bool = cfg!(feature = "onnx");
+
+/// Progress comes from real cache reads, model loading, inference and qualification.
+#[derive(Clone, Debug)]
+pub struct AiStatus {
+    pub stage: String,
+    pub detail: String,
+    pub provider: Option<Provider>,
+    pub progress: f32,
+}
+impl AiStatus {
+    pub(crate) fn new(
+        stage: &str,
+        detail: impl Into<String>,
+        provider: Option<Provider>,
+        progress: f32,
+    ) -> Self {
+        Self {
+            stage: stage.into(),
+            detail: detail.into(),
+            provider,
+            progress,
+        }
+    }
+}
 
 pub fn analyze_cached(
     image: &RgbaImage,
@@ -51,11 +77,70 @@ pub fn analyze_shared_cached(
     force: bool,
     stage: impl FnMut(Segmentation),
 ) -> Result<Segmentation> {
+    analyze_shared_cached_with_status(image, provider, force, stage, |_| {})
+}
+pub fn analyze_shared_cached_with_status(
+    image: &std::sync::Arc<RgbaImage>,
+    provider: Provider,
+    force: bool,
+    stage: impl FnMut(Segmentation),
+    status: impl FnMut(AiStatus),
+) -> Result<Segmentation> {
+    analyze_shared_demand_cached_with_status(
+        image,
+        provider,
+        force,
+        PortraitDemand::ALL,
+        None,
+        stage,
+        status,
+    )
+}
+
+pub fn analyze_shared_demand_cached_with_status(
+    image: &std::sync::Arc<RgbaImage>,
+    provider: Provider,
+    force: bool,
+    demand: PortraitDemand,
+    base: Option<&Segmentation>,
+    stage: impl FnMut(Segmentation),
+    mut status: impl FnMut(AiStatus),
+) -> Result<Segmentation> {
+    let demand = demand.normalized();
+    if demand.is_empty() {
+        return Ok(base.cloned().unwrap_or_default());
+    }
+    let base = base.filter(|seg| (seg.width, seg.height) == image.dimensions());
+    if !force && let Some(seg) = base.filter(|seg| seg.prepared.contains(demand)) {
+        status(AiStatus::new("Portrait maps ready", &seg.status, None, 1.0));
+        return Ok(seg.clone());
+    }
+    status(AiStatus::new(
+        "Checking portrait cache",
+        "Reading local analysis",
+        None,
+        0.05,
+    ));
     if !force && let Some(seg) = crate::ai_cache::load_shared(image, provider) {
+        status(AiStatus::new(
+            "Cached portrait ready",
+            &seg.status,
+            None,
+            1.0,
+        ));
         return Ok(seg);
     }
-    let seg = analyze_portrait(image, provider, stage)?;
-    if crate::ai_cache::save(image, &seg, provider).is_ok() {
+    let seg = analyze_portrait_demand_with_status(
+        image,
+        provider,
+        demand,
+        if force { None } else { base },
+        stage,
+        &mut status,
+    )?;
+    if seg.prepared.contains(PortraitDemand::ALL)
+        && crate::ai_cache::save(image, &seg, provider).is_ok()
+    {
         crate::ai_cache::associate(image, &seg, provider);
     }
     Ok(seg)
@@ -65,7 +150,40 @@ pub fn analyze_shared_cached(
 #[path = "portrait.rs"]
 pub(crate) mod portrait;
 #[cfg(feature = "onnx")]
-pub use portrait::analyze_portrait;
+pub use portrait::{
+    analyze_portrait, analyze_portrait_demand_with_status, analyze_portrait_with_status,
+    resident_model_count, take_model_run_trace,
+};
+
+/// Call on the owning inference thread. Photo maps and qualification decisions remain usable.
+pub fn release_idle_resources() {
+    #[cfg(feature = "onnx")]
+    portrait::release_idle_resources();
+}
+
+#[cfg(not(feature = "onnx"))]
+pub fn take_model_run_trace() -> Vec<String> {
+    Vec::new()
+}
+#[cfg(not(feature = "onnx"))]
+pub fn resident_model_count() -> usize {
+    0
+}
+
+#[cfg(not(feature = "onnx"))]
+pub fn analyze_portrait_demand_with_status(
+    image: &RgbaImage,
+    provider: Provider,
+    demand: PortraitDemand,
+    base: Option<&Segmentation>,
+    stage: impl FnMut(Segmentation),
+    status: impl FnMut(AiStatus),
+) -> Result<Segmentation> {
+    if demand.is_empty() {
+        return Ok(base.cloned().unwrap_or_default());
+    }
+    analyze_portrait_with_status(image, provider, stage, status)
+}
 #[cfg(not(feature = "onnx"))]
 pub fn analyze_portrait(
     _: &RgbaImage,
@@ -73,6 +191,15 @@ pub fn analyze_portrait(
     _: impl FnMut(Segmentation),
 ) -> Result<Segmentation> {
     bail!("This build has no ONNX support. Enable the onnx feature for portrait AI.")
+}
+#[cfg(not(feature = "onnx"))]
+pub fn analyze_portrait_with_status(
+    image: &RgbaImage,
+    provider: Provider,
+    stage: impl FnMut(Segmentation),
+    _: impl FnMut(AiStatus),
+) -> Result<Segmentation> {
+    analyze_portrait(image, provider, stage)
 }
 
 pub fn model_path(name: &str) -> std::path::PathBuf {
@@ -92,11 +219,25 @@ pub fn model_path(name: &str) -> std::path::PathBuf {
 
 #[cfg(feature = "onnx")]
 pub(crate) fn session(path: &Path, provider: Provider) -> Result<ort::session::Session> {
+    session_with_profile(path, provider, None)
+}
+#[cfg(feature = "onnx")]
+pub(crate) fn session_with_profile(
+    path: &Path,
+    provider: Provider,
+    profile: Option<&Path>,
+) -> Result<ort::session::Session> {
     use anyhow::Context;
     use ort::{ep, session::Session};
     let runtime = std::env::var_os("ORT_DYLIB_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
+            // ORT loads one runtime for the process. A DML build also supports CPU,
+            // so use it from the outset to allow switching between GPU and CPU.
+            let dml = model_path("directml/onnxruntime.dll");
+            if cfg!(windows) && dml.is_file() && model_path("directml/DirectML.dll").is_file() {
+                return dml;
+            }
             model_path(if cfg!(windows) {
                 "onnxruntime.dll"
             } else if cfg!(target_os = "macos") {
@@ -112,7 +253,7 @@ pub(crate) fn session(path: &Path, provider: Provider) -> Result<ort::session::S
         );
     }
     ort::init_from(&runtime)?
-        .with_name("Astra Retouch")
+        .with_name("Hastur Retouch")
         .commit();
     let mut builder = Session::builder()?
         .with_intra_threads(4)
@@ -126,14 +267,33 @@ pub(crate) fn session(path: &Path, provider: Provider) -> Result<ort::session::S
         .with_config_entry("session.set_denormal_as_zero", "1")
         .map_err(ort::Error::<()>::from)?;
     builder = match provider {
-        Provider::Cpu | Provider::Burn => builder,
-        Provider::DirectMl => builder
-            .with_parallel_execution(false)
-            .map_err(ort::Error::<()>::from)?
-            .with_memory_pattern(false)
-            .map_err(ort::Error::<()>::from)?
-            .with_execution_providers([ep::DirectML::default().build().error_on_failure()])
-            .map_err(ort::Error::<()>::from)?,
+        Provider::Auto | Provider::Cpu | Provider::Burn => builder,
+        Provider::DirectMl => {
+            builder = builder
+                .with_parallel_execution(false)
+                .map_err(ort::Error::<()>::from)?
+                .with_memory_pattern(false)
+                .map_err(ort::Error::<()>::from)?;
+            // Vendor metacommands on older Intel drivers return incorrect face
+            // tensors. Keep actual DirectML GPU kernels, but bypass that path.
+            use ort::AsPointer;
+            let keys = [c"device_id".as_ptr(), c"disable_metacommands".as_ptr()];
+            let values = [c"0".as_ptr(), c"true".as_ptr()];
+            // SAFETY: builder owns the live options; static C strings and arrays
+            // stay valid for the synchronous v24 ORT call.
+            unsafe {
+                ort::Error::result_from_status(
+                    (ort::api().SessionOptionsAppendExecutionProvider)(
+                        builder.ptr_mut(),
+                        c"DML".as_ptr(),
+                        keys.as_ptr(),
+                        values.as_ptr(),
+                        keys.len(),
+                    ),
+                )?;
+            }
+            builder
+        }
         Provider::Cuda => builder
             .with_execution_providers([ep::CUDA::default().build().error_on_failure()])
             .map_err(ort::Error::<()>::from)?,
@@ -141,6 +301,11 @@ pub(crate) fn session(path: &Path, provider: Provider) -> Result<ort::session::S
             .with_execution_providers([ep::CoreML::default().build().error_on_failure()])
             .map_err(ort::Error::<()>::from)?,
     };
+    if let Some(profile) = profile {
+        builder = builder
+            .with_profiling(profile)
+            .map_err(ort::Error::<()>::from)?;
+    }
     builder
         .commit_from_file(path)
         .with_context(|| format!("Cannot load {}", path.display()))
@@ -165,6 +330,13 @@ pub fn infer(
             "Burn inference currently supports the bundled portrait models only. Choose CPU for a custom ONNX mask model."
         );
     }
+    // Imported mask models have different output contracts. Auto keeps their
+    // established CPU behavior; explicit GPU providers remain available.
+    let provider = if provider == Provider::Auto {
+        Provider::Cpu
+    } else {
+        provider
+    };
     use ort::value::TensorRef;
     let mut session = session(path, provider)?;
     let size = if kind == Kind::FaceParsing { 512 } else { 1024 };
@@ -195,6 +367,7 @@ pub fn infer(
     let mut seg = Segmentation {
         width: w,
         height: h,
+        status: format!("{} · custom ONNX mask ready", provider.label()),
         ..Default::default()
     };
     if kind == Kind::FaceParsing {

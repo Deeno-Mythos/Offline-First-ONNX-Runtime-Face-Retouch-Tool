@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use astra_retouch::ui::AstraApp;
 use eframe::egui;
+use hastur_retouch::{branding, ui::HasturApp};
 
 fn main() -> eframe::Result {
     let arguments: Vec<_> = std::env::args().collect();
@@ -14,15 +14,16 @@ fn main() -> eframe::Result {
         .unwrap_or([1440.0, 940.0]);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Astra Retouch")
+            .with_title("Hastur Retouch")
+            .with_icon(branding::window_icon())
             .with_inner_size(size)
             .with_min_inner_size([600.0, 560.0]),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
     eframe::run_native(
-        "Astra Retouch",
+        "Hastur Retouch",
         options,
-        Box::new(|cc| Ok(Box::new(AstraApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(HasturApp::new(cc)))),
     )
 }

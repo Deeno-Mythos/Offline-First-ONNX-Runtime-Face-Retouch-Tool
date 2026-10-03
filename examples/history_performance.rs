@@ -1,6 +1,6 @@
 //! Benchmarks history operations independently of render latency or source-photo resolution.
 //! cargo run --release --no-default-features --example history_performance
-use astra_retouch::engine::{Edit, History, Stroke, Target};
+use hastur_retouch::engine::{Edit, History, Stroke, Target};
 use std::{hint::black_box, time::Instant};
 
 fn main() -> anyhow::Result<()> {
@@ -17,6 +17,7 @@ fn main() -> anyhow::Result<()> {
                     ],
                     radius: 0.002,
                     erase: false,
+                    strength: 100.0,
                     softness: 0.65,
                 })
                 .collect(),
@@ -70,6 +71,7 @@ fn main() -> anyhow::Result<()> {
                     center: [(index % 1000) as f32 / 1000.0, 0.5],
                     radius: 0.002,
                     erase: false,
+                    strength: 100.0,
                     softness: 0.65,
                 })
                 .collect(),
@@ -86,6 +88,7 @@ fn main() -> anyhow::Result<()> {
                     center: [stamp as f32 / 16.0, gesture as f32 / 200.0],
                     radius: 0.002,
                     erase: false,
+                    strength: 100.0,
                     softness: 0.65,
                 });
             }

@@ -1,6 +1,6 @@
 //! Render-only large-image and cached native-viewport measurements. No inference runs here.
 use anyhow::{Result, ensure};
-use astra_retouch::engine::{
+use hastur_retouch::engine::{
     self, Crop, Edit, ExportOptions, ExportSize, Renderer, Segmentation, Stroke, Target,
 };
 use std::{fs, path::PathBuf, sync::Arc, time::Instant};
@@ -139,16 +139,17 @@ fn main() -> Result<()> {
         center: [0.43, 0.33],
         radius: 0.004,
         erase: false,
+        strength: 100.0,
         softness: 0.7,
     });
-    edit.clones.push(astra_retouch::cleanup::CloneStamp {
+    edit.clones.push(hastur_retouch::cleanup::CloneStamp {
         center: [0.46, 0.44],
         source: [0.48, 0.43],
         radius: 0.005,
         softness: 0.7,
         strength: 80.0,
     });
-    edit.patches.push(astra_retouch::cleanup::PatchStroke {
+    edit.patches.push(hastur_retouch::cleanup::PatchStroke {
         boundary: vec![[0.39, 0.36], [0.40, 0.36], [0.40, 0.38], [0.39, 0.38]],
         offset: [0.025, 0.0],
         softness: 0.6,

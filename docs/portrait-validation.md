@@ -24,7 +24,7 @@ Reproduce after building:
 ```powershell
 $env:CARGO_PROFILE_RELEASE_LTO = 'false'
 cargo build --release --locked --example runtime_validation
-$env:ASTRA_AI_TIMINGS = '1'
+$env:HASTUR_AI_TIMINGS = '1'
 target/release/examples/runtime_validation.exe cpu assets/demo-portrait.png output/portrait-validation/backend-cpu 2
 target/release/examples/runtime_validation.exe burn assets/demo-portrait.png output/portrait-validation/backend-burn 2
 .ai-tools/Scripts/python.exe scripts/compare-ai-backends.py output/portrait-validation/backend-cpu output/portrait-validation/backend-burn output/portrait-validation/backend-comparison.json
@@ -38,7 +38,7 @@ Fixtures and licenses are recorded in [portrait-validation-sources.md](../script
 
 Local fixture SHA-256 values are `c794fcf6f62b868484dd52b8ecd7e204f693ead64c23ba3bb45bb47a982c1ba4` for the bundled demo and `bb4855db2bb4e5ab6879a20c19b909fdeea4756a36f49615b99c4022b83627ea` for the supplied JPEG. External fixture hashes are recorded in the source manifest and checked by the validation script.
 
-The integrated release fixture run completed at 20:05–20:07 on 2026-10-01, using `opt-level=3` and whole-profile `CARGO_PROFILE_RELEASE_LTO=false`. Native left/right eye and hair-edge crops were inspected without resizing, using original image detail. The full-resolution source images were used for the retouch renders; the smaller analysis overview was used only for inference.
+The final integrated release fixture run completed at 20:55–20:57 on 2026-10-01, using `opt-level=3` and whole-profile `CARGO_PROFILE_RELEASE_LTO=false`. Native left/right eye, hair-edge and head-halo outputs were checked without resizing, using original image detail and byte comparisons; the final flyaway review completed on 2026-10-02. The full-resolution source images were used for the retouch renders; the smaller analysis overview was used only for inference.
 
 All five fixtures retained their exact source dimensions. Facial-only Auto Retouch, under-eye 50/100 and skin 100 had zero changed pixels outside expanded face bounds. Both under-eye settings had zero changed pixels outside the quantized under-eye mask, and 100 produced a larger overall pixel effect than 50. Auto Retouch left contrast and exposure at zero.
 
@@ -54,7 +54,21 @@ Brightness deltas are measured RGB-byte luminance changes within pixels whose un
 
 Each fixture's `output/portrait-validation/<name>/results.txt` contains the counts, timing and mask-scope checks. The eye and hair artifacts are `left-eye-<case>-native.png`, `right-eye-<case>-native.png` and `hair-edge-<case>-native.png`. William Stitt's supplemental 640×480 lip/stubble review crops are in `output/portrait-validation/review/beard-<case>-native.png`; `beard-crop.txt` records the crop coordinates. A 501×768 crop centered on face-oval landmark 356 specifically checks the supplied portrait's previously circled temple/cheek hair boundary, in `review/supplied-temple-<case>-native.png`; `supplied-temple-crop.txt` records its coordinates. Auto Retouch, under-eye 100 and skin 100 retain that edge and overlapping wisps without the previously reported smear. These supplemental images are untouched rectangular samples of the native face renders, with no resizing.
 
-Flyaway cleanup needs a further check before final sign-off: in this run, the studio demo's hair-edge crop contained scattered corrections inside coherent hair reflections (701 changed pixels, maximum 63-byte difference). The supplied portrait's hair-edge changes were much smaller (118 pixels, maximum 17 bytes), and William Stitt's hair-edge sample was byte-identical. Facial-only retouch passed the hair-boundary review; these findings concern the separately enabled flyaway setting at 100.
+## Final flyaway cleanup review
+
+The detector requires agreeing background donors, broad background support around the candidate, and majority color-family agreement with the outer head-halo boundary. These guards prevent interior hair reflections from being treated as background. The final native review found no remaining visible hair speckling or contour smearing in these fixtures.
+
+| Fixture | Changed pixels at flyaway 100 | Maximum channel difference | Final head-halo result |
+| --- | ---: | ---: | --- |
+| Studio demo | 76 | 65 bytes | Small exterior-strand segments lighten toward the gray background; coherent hair reflections are retained. |
+| Eileen Collins | 0 | 0 | Native head halo is byte-identical to the original. |
+| Grace Hopper | 0 | 0 | Native head halo is byte-identical; glasses, hat and textured backdrop are preserved. |
+| William Stitt | 0 | 0 | Native head halo is byte-identical, including facial hair. |
+| Supplied portrait | 14 | 14 bytes | A few exterior strand pixels above and beside the head lighten toward the studio backdrop; the temple/hair boundary stays intact. |
+
+All seven specifically reported internal demo hair/reflection pixels now have zero byte difference, and four visually verified exterior-strand pixels retain nonzero corrections. The demo's entire saved right hair-edge crop is byte-identical. Flyaway-only left/right eye crops are byte-identical for all five fixtures. The refreshed supplemental supplied-temple and William Stitt lip/stubble flyaway crops are also byte-identical to their originals. The full eligible head-halo artifacts are `head-halo-{original,flyaway-100}-native.png`; `output/portrait-validation/review/final-native-qa.json` records dimensions, counts and the seven/four regression points.
+
+Flyaway cleanup remains a conservative local strand heuristic guided by detected heads, not a semantic hair model or a retrained network. Its verified improvement here is partial thinning of a few exterior strand segments; many wisps remain even at 100, and three fixtures intentionally produce no change. Complex backgrounds, weak contrast and large hair locks still need the manual cleanup tools. These native results support safe localized behavior on this set, not automatic removal of every stray hair or quality across every skin tone, pose and background.
 
 Reproduce native validation with the release build:
 
@@ -62,6 +76,6 @@ Reproduce native validation with the release build:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate-portraits.ps1
 ```
 
-Use `-SkipDownload` when the three hash-verified external fixtures already exist locally. Use `-SkipBuild` to validate an already-built helper with its existing build settings. Add `-Backends` only to repeat the CPU/Burn inference benchmark. Each native fixture directory contains `results.txt`, `segmentation.ron`, raw inference maps, and unresized original/Auto Retouch/under-eye 50 and 100/skin 100/flyaway 100 face and detail crops.
+Use `-SkipDownload` when the three hash-verified external fixtures already exist locally. Use `-SkipBuild` to validate an already-built helper with its existing build settings. Add `-Backends` only to repeat the CPU/Burn inference benchmark. Each native fixture directory contains `results.txt`, `segmentation.ron`, raw inference maps, unresized original/Auto Retouch/under-eye 50 and 100/skin 100/flyaway 100 face and detail crops, and original/flyaway head-halo crops.
 
-The native run asserts unchanged source dimensions, a larger overall under-eye pixel effect at 100 than 50, zero changed pixels outside the quantized under-eye mask, and zero changed pixels outside expanded face bounds for facial-only edits. Auto Retouch starts with zero contrast and exposure and retains those values. These checks establish registration and effect scope; visual review is still required for eyelashes, glasses, facial hair, the skin/hair boundary and texture quality within the edited area. The saved hair-edge detail is one side of the head, so it does not by itself cover every stray hair or every background edge.
+The native run asserts unchanged source dimensions, a larger overall under-eye pixel effect at 100 than 50, zero changed pixels outside the quantized under-eye mask, and zero changed pixels outside expanded face bounds for facial-only edits. Auto Retouch starts with zero contrast and exposure and retains those values. These checks establish registration and effect scope; visual review is still required for eyelashes, glasses, facial hair, the skin/hair boundary and texture quality within the edited area. The saved hair-edge detail is one side of the head; the additional head-halo samples cover the detector's complete eligible area after clipping to the source bounds.
