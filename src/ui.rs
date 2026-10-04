@@ -48,6 +48,10 @@ mod app_chrome;
 mod manual_tools;
 use app_chrome::PreferencesTab;
 
+#[doc(hidden)]
+#[path = "feedback_diagnostics.rs"]
+pub mod feedback_diagnostics;
+
 #[cfg(test)]
 #[path = "ui_tests.rs"]
 mod tests;
@@ -227,6 +231,8 @@ pub struct HasturApp {
     importing: bool,
     import_batches: usize,
     render_busy: bool,
+    // Diagnostic replay can compare the former serial overview/native policy.
+    sharp_canvas_first: bool,
     preview_cancel: Option<(u64, u64, Arc<AtomicBool>)>,
     detail_cancel: Option<Arc<AtomicBool>>,
     hover_cancel: Option<Arc<AtomicBool>>,
@@ -525,6 +531,7 @@ impl HasturApp {
                 "heal" => Some(Target::Heal),
                 "clone" => Some(Target::Clone),
                 "patch" => Some(Target::Patch),
+                "mask" => Some(Target::LayerMask),
                 _ => None,
             });
         Self {
@@ -559,6 +566,7 @@ impl HasturApp {
             importing: true,
             import_batches: 1,
             render_busy: false,
+            sharp_canvas_first: true,
             preview_cancel: None,
             detail_cancel: None,
             hover_cancel: None,
@@ -1548,19 +1556,28 @@ impl HasturApp {
     }
 
     fn schedule_preview(&mut self, ctx: &egui::Context, live_brush: bool) {
-        if live_brush
-            && self.photos.get(self.current).is_some_and(|photo| {
-                needs_detail_resolution(&photo.photo, photo.view.scale)
-                    && photo.photo.dimensions() != photo.photo.preview.dimensions()
-            })
-        {
-            ctx.request_repaint_after(Duration::from_millis(16));
-            return;
-        }
         let brush_dirty = self.photos.get(self.current).is_some_and(|photo| {
             self.brush_preview.is_some_and(|(id, _)| id == photo.id)
                 && photo.revision != photo.rendered_revision
         });
+        // Finish the sharp canvas first, including short clicks and released
+        // strokes. The overview can update the filmstrip once that frame is ready.
+        if self.photos.get(self.current).is_some_and(|photo| {
+            needs_detail_resolution(&photo.photo, photo.view.scale)
+                && photo.photo.dimensions() != photo.photo.preview.dimensions()
+                && (live_brush
+                    || (self.sharp_canvas_first
+                        && brush_dirty
+                        && !self
+                            .detail_region
+                            .as_ref()
+                            .is_some_and(|(id, revision, _, _)| {
+                                *id == photo.id && *revision == photo.revision
+                            })))
+        }) {
+            ctx.request_repaint_after(Duration::from_millis(16));
+            return;
+        }
         let first_brush_preview = brush_dirty
             && self.photos.get(self.current).is_some_and(|photo| {
                 self.brush_preview
@@ -2014,6 +2031,29 @@ impl HasturApp {
                         }
                     });
                     hit(ui, "view-menu", view_menu.response.rect);
+                    ui.menu_button(RichText::new("Help").color(MUTED), |ui| {
+                        ui.label(concat!("Hastur Retouch ", env!("CARGO_PKG_VERSION")));
+                        if ui.button("Copy build version").clicked() {
+                            ui.ctx().copy_text(format!(
+                                "Hastur Retouch {} · {} {}",
+                                env!("CARGO_PKG_VERSION"),
+                                std::env::consts::OS,
+                                std::env::consts::ARCH
+                            ));
+                        }
+                        ui.separator();
+                        ui.hyperlink_to(
+                            "Send beta feedback",
+                            concat!(
+                                "mailto:suboptimald1@gmail.com?subject=Hastur%20Retouch%20",
+                                env!("CARGO_PKG_VERSION"),
+                                "%20feedback"
+                            ),
+                        );
+                        if ui.button("Copy feedback email").clicked() {
+                            ui.ctx().copy_text("suboptimald1@gmail.com".into());
+                        }
+                    });
                     ui.add_space(4.0);
                     let undo = self
                         .photos
@@ -3709,6 +3749,17 @@ impl HasturApp {
                         hit(ui,"clone-aligned",aligned.rect);
                         if aligned.changed() { self.clone_offset = None; self.end_canvas_gesture(); }
                     }
+                    if matches!(target, Target::Heal | Target::Clone) {
+                            let edit = &mut self.photos[self.current].edit;
+                            let mut visible = edit.active_layer().is_some_and(|layer| layer.sample_visible);
+                            let sample = ui.checkbox(&mut visible, "Sample visible layers")
+                                .on_hover_text("Samples the other visible layers, including those above this layer. The active layer is excluded to prevent self-copy feedback.");
+                            hit(ui, "sample-visible-layers-inspector", sample.rect);
+                            if sample.changed() {
+                                edit.ensure_stack();
+                                if let Some(layer) = edit.active_layer_mut() { layer.sample_visible = visible; }
+                            }
+                    }
                     if target == Target::Liquify && !self.photos[self.current].edit.warps.is_empty() {
                         let reset = ui.button("Reset liquify"); hit(ui,"liquify-reset",reset.rect);
                         if reset.clicked() { self.photos[self.current].edit.warps.clear(); }
@@ -3949,7 +4000,9 @@ impl HasturApp {
             .show(ctx, |ui| {
                 hit(ui, "canvas-content", ui.max_rect());
                 ui.horizontal(|ui| {
-                    if self.brush.is_some_and(manual_tools::is_manual) && !self.photos.is_empty() {
+                    if self.brush == Some(Target::LayerMask) && !self.photos.is_empty() {
+                        ui.allocate_ui_with_layout(vec2((ui.available_width()-130.).max(160.),34.), egui::Layout::left_to_right(egui::Align::Center), |ui| self.mask_workspace_bar(ui));
+                    } else if self.brush.is_some_and(manual_tools::is_manual) && !self.photos.is_empty() {
                         ui.allocate_ui_with_layout(vec2((ui.available_width()-130.).max(160.),34.), egui::Layout::left_to_right(egui::Align::Center), |ui| self.manual_workspace_bar(ui));
                     } else {
                         ui.label(RichText::new("PORTRAIT WORKSPACE").size(10.0).color(MUTED));
@@ -3990,6 +4043,11 @@ impl HasturApp {
                         TEXT,
                     );
                     return;
+                }
+                if self.brush == Some(Target::LayerMask)
+                    && self.photos[self.current].edit.active_layer().is_none_or(|layer| layer.mask.is_none())
+                {
+                    self.brush = None;
                 }
                 let dpi = ctx.pixels_per_point();
                 let dimensions = vec2(
@@ -4447,7 +4505,8 @@ impl HasturApp {
                 }
                 if native
                     && !detail_ready
-                    && (live_brush || p.rendered_revision == p.revision)
+                    && (live_brush || p.rendered_revision == p.revision
+                        || (self.sharp_canvas_first && self.brush_preview.is_some_and(|(id, _)| id == p.id)))
                     && self.detail_region_pending.is_none()
                     && p.photo.dimensions() != p.photo.preview.dimensions()
                 {

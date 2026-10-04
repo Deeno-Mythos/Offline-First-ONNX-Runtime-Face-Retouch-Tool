@@ -135,8 +135,7 @@ fn references(
         .iter()
         .flat_map(|face| crate::model::portrait::eye_regions(face, w, h))
         .map(|eye| {
-            let mut sum = 0.0;
-            let mut count = 0;
+            let mut cheek_samples = Vec::with_capacity(9);
             for below in [0.78, 0.98, 1.18] {
                 for across in [-0.2, 0.0, 0.2] {
                     let x = eye.lower[0]
@@ -168,16 +167,18 @@ fn references(
                     if masks.value(0, 3) > 0.18 {
                         continue;
                     }
-                    sum += lum(&sampler.at(px, py));
-                    count += 1;
+                    cheek_samples.push(lum(&sampler.at(px, py)));
                 }
             }
-            let luma = if count == 0 {
+            let luma = if cheek_samples.is_empty() {
                 let x = (eye.lower[0] + eye.down[0] * eye.width).round() as u32;
                 let y = (eye.lower[1] + eye.down[1] * eye.width).round() as u32;
                 lum(&sampler.at(x.min(w - 1), y.min(h - 1)))
             } else {
-                sum / count as f32
+                cheek_samples.sort_by(f32::total_cmp);
+                (cheek_samples[cheek_samples.len() / 2]
+                    + cheek_samples[cheek_samples.len() * 3 / 4])
+                    * 0.5
             };
             UnderEyeReference { eye, luma }
         })
@@ -214,7 +215,7 @@ fn shadow_lift(
                     d(a).total_cmp(&d(b))
                 })
                 .unwrap();
-            (reference.luma - lum_half(&low[i]) - 0.012).clamp(0.0, 0.12) * region * 0.9
+            (reference.luma - lum_half(&low[i]) - 0.008).clamp(0.0, 0.12) * region * 0.9
         })
         .collect()
 }

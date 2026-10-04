@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hastur Retouch beta · Quick start</title>
+<style>body{margin:0;background:#0b0b0c;color:#ededee;font:17px/1.65 system-ui,sans-serif}main{max-width:820px;margin:auto;padding:40px 28px 60px}h1{line-height:1.2;font-size:38px}h2{font-size:23px;margin-top:36px}a{color:#ffd60a}kbd,code{background:#242427;border-radius:5px;padding:2px 6px;font-size:.9em}.tag{color:#ffd60a;letter-spacing:.1em;font-size:13px}.note{border-left:3px solid #ffd60a;padding:8px 20px;background:#141416}li{margin:10px 0}footer{border-top:1px solid #333;margin-top:40px;padding-top:16px;color:#aaa}</style>
+<main><p class="tag">HASTUR RETOUCH · 0.1.0-beta.1</p>
+<h1>Your portrait workspace</h1>
+<p>Import a portrait, make local corrections, and export a separate finished image. Your original file stays intact. AI runs on your computer.</p>
+<p class="note">This is a beta. Check face details at 100% before sharing exports and keep your originals. The first AI analysis and the first stroke after changing the view can take longer.</p>
+<h2>Start editing</h2>
+<ol><li>Install the beta, then open <strong>Hastur Retouch Beta</strong> from Start. Models and runtimes are included; internet, Rust and Python are not needed for editing.</li>
+<li>Choose <strong>Import</strong>, drag a photo into the workspace, or press <kbd>Ctrl+O</kbd>. JPEG, PNG, TIFF, WebP and BMP are supported. RAW files are not supported.</li>
+<li>Use <strong>Auto Retouch</strong> for facial cleanup, then adjust the individual strengths. Auto Retouch preserves your existing contrast, exposure and shape settings. Face reshaping and background changes are explicit controls.</li>
+<li>Use <strong>100%</strong> to judge pores, eyes and fine hairs. Scroll to zoom around the pointer; hold <kbd>Space</kbd> and drag to move the image while a tool is selected. Press <kbd>0</kbd> to fit.</li>
+<li>Open <strong>Layers</strong> or <strong>History</strong> from View. Toggle layer visibility, adjust opacity, and add a mask to reveal or hide parts of a correction.</li>
+<li>Save the workspace with <kbd>Ctrl+S</kbd>. Use <strong>Export</strong> for a finished photo. Choose <strong>Original size</strong> and PNG for lossless pixel inspection; JPEG is compressed. Export creates a separate versioned file.</li></ol>
+<h2>Manual cleanup</h2>
+<ul><li><strong>Liquify:</strong> drag to push pixels. Start with a small brush and short movements.</li>
+<li><strong>Spot heal:</strong> click or drag over a small mark. It transfers nearby texture with color matching.</li>
+<li><strong>Clone stamp:</strong> <kbd>Alt</kbd>+click clean texture, then paint the destination. Choose source also works. Enable alignment to keep the source offset between strokes.</li>
+<li><strong>Patch:</strong> draw a closed selection around the repair area, then drag it onto clean texture and confirm the repair.</li>
+<li>Heal and Clone can sample other visible layers. Paint on an unlocked, visible layer with nonzero opacity; a black mask hides the correction.</li></ul>
+<p><kbd>Ctrl+Z</kbd> undoes a gesture; <kbd>Ctrl+Shift+Z</kbd> redoes it. Hold <kbd>\</kbd> to inspect the original. <kbd>Ctrl+,</kbd> opens Preferences; <kbd>Ctrl+K</kbd> finds commands. Preference controls include UI size, zoom speed, brush defaults, autosave and export quality.</p>
+<h2>AI and hardware</h2>
+<p>Auto checks GPU results against CPU before accepting DirectML. CPU remains available when GPU qualification fails. The beta has been checked locally on an Intel UHD GPU; other GPUs need tester verification. The experimental Burn CPU provider is available but can be substantially slower. CUDA and CoreML are not bundled for this Windows beta.</p>
+<p>Use 64-bit Windows 10 version 2004 or later, or Windows 11, with a current graphics driver. The development checks used 16 GB RAM. Smaller-memory systems and other hardware are not yet qualified. High-resolution editing and several active AI stages can consume several GB of memory.</p>
+<h2>Saved data and privacy</h2>
+<p>Preferences, recovery workspaces and AI caches are kept under <code>%LOCALAPPDATA%\HasturRetouch</code>. Your saved session refers to the imported files; keep those files available. Uninstalling removes program files and leaves your photos, exported images and workspace data in place. Recovery opens the latest usable workspace automatically.</p>
+<p>No photo uploads, telemetry, account login or automatic feedback sending are included. Clicking an email link opens your mail app; you decide what to send. Models, licenses and source notices are included in the installation. See <a href="Third-party-notices.txt">third-party notices</a> and <a href="licenses/Rust-THIRD-PARTY-NOTICES.txt">Rust dependency notices</a>.</p>
+<h2>Feedback</h2>
+<p>Email <a href="mailto:suboptimald1@gmail.com?subject=Hastur%20Retouch%200.1.0-beta.1%20feedback">suboptimald1@gmail.com</a>, or use Help → Send beta feedback. Include the copied build version, Windows version, GPU/driver, image dimensions, tool settings, reproduction steps, and what you expected to see. Screenshots and photos are optional; share only what you are comfortable sending.</p>
+<footer>Hastur Retouch · Public beta planned for October 6, 2026</footer></main></html>

@@ -36,7 +36,15 @@ pub fn install(cc: &eframe::CreationContext<'_>) -> bool {
     let Some(state) = &cc.wgpu_render_state else {
         return false;
     };
-    let device = &state.device;
+    state
+        .renderer
+        .write()
+        .callback_resources
+        .insert(canvas_resources(&state.device, state.target_format));
+    true
+}
+
+fn canvas_resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Resources {
     let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("Hastur linear canvas layout"),
         entries: &[
@@ -101,7 +109,7 @@ pub fn install(cc: &eframe::CreationContext<'_>) -> bool {
             entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: state.target_format,
+                format,
                 blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -125,8 +133,8 @@ pub fn install(cc: &eframe::CreationContext<'_>) -> bool {
         min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
-    state.renderer.write().callback_resources.insert(Resources {
-        format: state.target_format,
+    Resources {
+        format,
         render,
         upload,
         texture_layout,
@@ -136,8 +144,7 @@ pub fn install(cc: &eframe::CreationContext<'_>) -> bool {
         edited: None,
         bind: None,
         uniform_value: None,
-    });
-    true
+    }
 }
 
 struct LinearUpload {

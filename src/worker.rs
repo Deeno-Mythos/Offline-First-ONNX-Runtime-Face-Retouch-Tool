@@ -37,6 +37,9 @@ const AI_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 pub enum Job {
     ReleaseMemory,
+    /// A/B replay only; production workers enable incremental manual previews.
+    #[doc(hidden)]
+    DiagnosticsPreviewPolicy(bool),
     LoadAsset {
         id: u64,
         request: u64,
@@ -254,6 +257,50 @@ pub enum Message {
     ExportReport(anyhow::Result<PathBuf>),
 }
 
+fn render_preview(
+    renderer: &mut engine::Renderer,
+    image: &Arc<RgbaImage>,
+    edit: &Edit,
+    seg: Option<&Arc<Segmentation>>,
+    cancel: &AtomicBool,
+    incremental: bool,
+) -> anyhow::Result<RgbaImage> {
+    let manual = |edit: &Edit| {
+        !edit.warps.is_empty()
+            || !edit.clones.is_empty()
+            || !edit.patches.is_empty()
+            || edit
+                .strokes
+                .iter()
+                .any(|stroke| stroke.target == engine::Target::Heal)
+    };
+    if incremental
+        && (manual(edit)
+            || edit.stack.layers.iter().any(|layer| {
+                manual(&layer.edit)
+                    || layer
+                        .mask
+                        .as_ref()
+                        .is_some_and(|mask| !mask.strokes.is_empty())
+            }))
+    {
+        renderer.render_viewport(
+            image,
+            edit,
+            seg,
+            engine::Crop {
+                x: 0,
+                y: 0,
+                width: image.width(),
+                height: image.height(),
+            },
+            Some(cancel),
+        )
+    } else {
+        renderer.render(image, edit, seg, Some(cancel))
+    }
+}
+
 pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
     let (tx, rx) = crossbeam_channel::unbounded();
     let (out, results) = crossbeam_channel::unbounded();
@@ -266,6 +313,7 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
         .name("hastur-native-preview".into())
         .spawn(move || {
             let mut renderer = engine::Renderer::default();
+            let mut incremental = true;
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(
                     std::thread::available_parallelism()
@@ -323,7 +371,14 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
                                 crop,
                                 Some(&cancel),
                             ),
-                            None => renderer.render(&image, &edit, seg.as_ref(), Some(&cancel)),
+                            None => render_preview(
+                                &mut renderer,
+                                &image,
+                                &edit,
+                                seg.as_ref(),
+                                &cancel,
+                                incremental,
+                            ),
                         });
                         Message::PatchPreview {
                             id,
@@ -334,6 +389,11 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
                         }
                     }
                     Job::ReleaseMemory => {
+                        renderer = engine::Renderer::default();
+                        continue;
+                    }
+                    Job::DiagnosticsPreviewPolicy(enabled) => {
+                        incremental = enabled;
                         renderer = engine::Renderer::default();
                         continue;
                     }
@@ -350,6 +410,7 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
         .name("hastur-live-preview".into())
         .spawn(move || {
             let mut renderer = engine::Renderer::default();
+            let mut incremental = true;
             let threads = std::thread::available_parallelism()
                 .map_or(2, usize::from)
                 .div_ceil(2)
@@ -361,6 +422,11 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
                 .expect("cannot start live pixel workers");
             while let Ok(job) = preview_rx.recv() {
                 if matches!(job, Job::ReleaseMemory) {
+                    renderer = engine::Renderer::default();
+                    continue;
+                }
+                if let Job::DiagnosticsPreviewPolicy(enabled) = job {
+                    incremental = enabled;
                     renderer = engine::Renderer::default();
                     continue;
                 }
@@ -380,9 +446,16 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
                     let _ = preview_out.send(Message::RenderStarted { id, revision, kind });
                     preview_ctx.request_repaint();
                 }
-                let message = match pool
-                    .install(|| renderer.render(&image, &edit, seg.as_ref(), Some(&cancel)))
-                {
+                let message = match pool.install(|| {
+                    render_preview(
+                        &mut renderer,
+                        &image,
+                        &edit,
+                        seg.as_ref(),
+                        &cancel,
+                        incremental,
+                    )
+                }) {
                     Ok(image) => Message::Rendered {
                         kind,
                         id,
@@ -429,6 +502,11 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
         .name("hastur-image-dispatch".into())
         .spawn(move || {
             while let Ok(job) = rx.recv() {
+                if let Job::DiagnosticsPreviewPolicy(enabled) = job {
+                    let _ = preview_tx.send(Job::DiagnosticsPreviewPolicy(enabled));
+                    let _ = detail_tx.send(Job::DiagnosticsPreviewPolicy(enabled));
+                    continue;
+                }
                 if matches!(job, Job::ReleaseMemory) {
                     let _ = preview_tx.send(Job::ReleaseMemory);
                     let _ = detail_tx.send(Job::ReleaseMemory);
@@ -667,7 +745,7 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
                     Job::ReleaseMemory => {
                         renderer = engine::Renderer::default();
                     }
-                    Job::LoadAsset { .. } => continue,
+                    Job::LoadAsset { .. } | Job::DiagnosticsPreviewPolicy(_) => continue,
                     Job::ImportFolder(directory) => match crate::assets::folder_files(&directory) {
                         Ok(paths) => {
                             let _ = import_tx.send(paths.into_iter().take(64).map(Some).collect());
@@ -874,7 +952,10 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
 
 fn priority(job: &Job) -> u8 {
     match job {
-        Job::ReleaseMemory | Job::LoadAsset { .. } | Job::ImportFolder(_) => 0,
+        Job::ReleaseMemory
+        | Job::DiagnosticsPreviewPolicy(_)
+        | Job::LoadAsset { .. }
+        | Job::ImportFolder(_) => 0,
         #[cfg(test)]
         Job::BackgroundBarrier { .. } => 0,
         Job::Portrait { .. }
@@ -1030,6 +1111,95 @@ fn export_prepared(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn fitted_manual_preview_updates_are_local_and_match_complete_pixels() {
+        use engine::{Stroke, Target};
+        let image = Arc::new(RgbaImage::from_fn(320, 240, |x, y| {
+            image::Rgba([
+                (40 + (x * 7 + y * 3) % 180) as u8,
+                (45 + (x * 3 + y * 5) % 170) as u8,
+                (55 + (x * 5 + y * 11) % 160) as u8,
+                255,
+            ])
+        }));
+        let cancel = AtomicBool::new(false);
+        for tool in [Target::Liquify, Target::Heal, Target::Clone, Target::Patch] {
+            let mut incremental = engine::Renderer::default();
+            let mut complete = engine::Renderer::default();
+            let mut edit = Edit::default();
+            edit.settings.exposure = 0.2;
+            for step in 0..3 {
+                let center = [0.4 + step as f32 * 0.015, 0.5];
+                match tool {
+                    Target::Liquify => edit.warps.push(crate::geometry::WarpStroke {
+                        center,
+                        delta: [0.008, -0.004],
+                        radius: 0.047,
+                        softness: 0.7,
+                        strength: 85.0,
+                    }),
+                    Target::Heal => edit.strokes.push(Stroke {
+                        center,
+                        target: tool,
+                        radius: 0.036,
+                        softness: 0.7,
+                        erase: false,
+                        strength: 100.0,
+                    }),
+                    Target::Clone => edit.clones.push(crate::cleanup::CloneStamp {
+                        center,
+                        source: [center[0] + 0.1, center[1] - 0.08],
+                        radius: 0.04,
+                        softness: 0.7,
+                        strength: 90.0,
+                    }),
+                    Target::Patch => {
+                        if edit.patches.is_empty() {
+                            edit.patches.push(crate::cleanup::PatchStroke {
+                                boundary: vec![
+                                    [0.4, 0.45],
+                                    [0.46, 0.45],
+                                    [0.46, 0.53],
+                                    [0.4, 0.53],
+                                ],
+                                offset: [0.1, -0.08],
+                                softness: 0.7,
+                                strength: 95.0,
+                            });
+                        } else {
+                            edit.patches[0].offset[0] += 0.01;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                let frame =
+                    render_preview(&mut incremental, &image, &edit, None, &cancel, true).unwrap();
+                assert_eq!(
+                    frame,
+                    render_preview(&mut complete, &image, &edit, None, &cancel, false).unwrap(),
+                    "{tool:?} step {step}"
+                );
+                if step > 0 {
+                    let damage = incremental.viewport_damage().unwrap();
+                    assert!(
+                        damage.width * damage.height < image.width() * image.height() / 4,
+                        "{tool:?} must redraw only its affected area"
+                    );
+                }
+            }
+            let cancelled = AtomicBool::new(true);
+            assert!(
+                render_preview(&mut incremental, &image, &edit, None, &cancelled, true).is_err()
+            );
+            // Undo/removal cannot retain pixels from the previous manual frame.
+            let reset = Edit::default();
+            assert_eq!(
+                render_preview(&mut incremental, &image, &reset, None, &cancel, true).unwrap(),
+                *image
+            );
+        }
+    }
 
     #[test]
     fn queued_projects_keep_independent_ids_formats_and_continue_after_cancellation() {

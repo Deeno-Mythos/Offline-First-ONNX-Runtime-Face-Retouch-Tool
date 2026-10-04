@@ -26,7 +26,7 @@ pub(super) struct PatchFrame {
     pub texture: egui::TextureHandle,
     pub original_texture: egui::TextureHandle,
     pub committed: bool,
-    patch: crate::cleanup::PatchStroke,
+    pub(super) patch: crate::cleanup::PatchStroke,
 }
 impl PatchFeedback {
     pub fn busy(&self) -> bool {
@@ -46,6 +46,7 @@ enum Blocker {
     Hidden,
     Transparent,
     Covered,
+    Masked,
     Group(LayerKind),
     HealingDisabled,
     Strength,
@@ -57,6 +58,7 @@ impl Blocker {
             Self::Hidden => "Selected layer is hidden. Show it to see your edits.",
             Self::Transparent => "Selected layer has 0% opacity.",
             Self::Covered => "An original-copy layer above hides this layer's edits.",
+            Self::Masked => "The layer mask hides this entire layer.",
             Self::Group(_) => "This tool is disabled in the saved layer settings.",
             Self::HealingDisabled => "Healing is disabled in this layer.",
             Self::Strength => "Brush strength is 0%.",
@@ -67,6 +69,7 @@ impl Blocker {
             Self::Locked | Self::Covered => "New retouch layer",
             Self::Hidden => "Show layer",
             Self::Transparent => "Set opacity to 100%",
+            Self::Masked => "Reveal layer mask",
             Self::Group(_) | Self::HealingDisabled => "Enable tool",
             Self::Strength => "Set strength to 100%",
         }
@@ -92,6 +95,13 @@ impl HasturApp {
             if layer.factor() == 0. {
                 return Some(Blocker::Transparent);
             }
+            if layer
+                .mask
+                .as_ref()
+                .is_some_and(|mask| mask.base == 0 && mask.strokes.is_empty())
+            {
+                return Some(Blocker::Masked);
+            }
             let index = edit
                 .stack
                 .layers
@@ -102,6 +112,9 @@ impl HasturApp {
                 l.kind == LayerType::OriginalCopy
                     && l.factor() == 1.
                     && l.blend == BlendMode::Normal
+                    && l.mask
+                        .as_ref()
+                        .is_none_or(|mask| mask.base == 255 && mask.strokes.is_empty())
             }) {
                 return Some(Blocker::Covered);
             }
@@ -146,6 +159,15 @@ impl HasturApp {
             }
             Blocker::Transparent => {
                 photo.edit.active_layer_mut().unwrap().opacity = 100.;
+            }
+            Blocker::Masked => {
+                if let Some(mask) = photo
+                    .edit
+                    .active_layer_mut()
+                    .and_then(|layer| layer.mask.as_mut())
+                {
+                    mask.base = 255;
+                }
             }
             Blocker::Group(kind) => {
                 let group = photo.edit.layers.get_mut(kind);
@@ -213,12 +235,36 @@ impl HasturApp {
                 120.
             } else {
                 0.
+            } + if matches!(target, Target::Heal | Target::Clone) {
+                150.
+            } else {
+                0.
             };
             ui.add_sized(
                 vec2((ui.available_width() - reserve).max(70.), 34.),
                 egui::Label::new(RichText::new(text).size(11.).color(YELLOW)).truncate(),
             )
             .on_hover_text(text);
+            if matches!(target, Target::Heal | Target::Clone) {
+                let p = &mut self.photos[self.current];
+                let before = p.edit.clone();
+                let mut visible = p
+                    .edit
+                    .active_layer()
+                    .is_some_and(|layer| layer.sample_visible);
+                let sample = ui.checkbox(&mut visible, "Visible layers")
+                    .on_hover_text("Sample other visible layers, including layers above. Excludes the active layer to prevent self-copy feedback.");
+                hit(ui, "sample-visible-layers", sample.rect);
+                if sample.changed() {
+                    p.edit.ensure_stack();
+                    if let Some(layer) = p.edit.active_layer_mut() {
+                        layer.sample_visible = visible;
+                    }
+                    p.history.record(before);
+                    self.end_canvas_gesture();
+                    self.edited();
+                }
+            }
             if target == Target::Clone {
                 let pick = ui.button("Choose source");
                 hit(ui, "clone-pick-source", pick.rect);
@@ -235,6 +281,51 @@ impl HasturApp {
                     self.end_canvas_gesture();
                 }
             }
+        }
+    }
+    pub(super) fn mask_workspace_bar(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Layer mask").color(YELLOW));
+        let reveal = ui.checkbox(&mut self.erase, "Reveal");
+        hit(ui, "mask-reveal", reveal.rect);
+        ui.checkbox(&mut self.show_mask, "Overlay");
+        let short = self.photos[self.current]
+            .photo
+            .dimensions()
+            .0
+            .min(self.photos[self.current].photo.dimensions().1) as f32;
+        let mut diameter = self.brush_radius * short * 2.0;
+        let size = ui.add(
+            egui::DragValue::new(&mut diameter)
+                .range(2.0..=short * 0.3)
+                .speed(1.0)
+                .suffix(" px"),
+        );
+        if size.changed() {
+            self.brush_radius = diameter / (short * 2.0);
+        }
+        if ui.available_width() > 270.0 {
+            ui.add(
+                egui::DragValue::new(&mut self.brush_strength)
+                    .range(0.0..=100.0)
+                    .speed(1.0)
+                    .prefix("Strength ")
+                    .suffix("%"),
+            );
+            let mut softness = self.brush_softness * 100.0;
+            let soft = ui.add(
+                egui::DragValue::new(&mut softness)
+                    .range(0.0..=100.0)
+                    .speed(1.0)
+                    .prefix("Soft ")
+                    .suffix("%"),
+            );
+            if soft.changed() {
+                self.brush_softness = softness / 100.0;
+            }
+        }
+        if ui.button("Done").clicked() {
+            self.brush = None;
+            self.end_canvas_gesture();
         }
     }
     pub(super) fn reject_manual_stroke(&mut self) {

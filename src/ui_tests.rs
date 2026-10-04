@@ -12,6 +12,130 @@ fn primary(pos: Pos2, pressed: bool, modifiers: Modifiers) -> Event {
 }
 
 #[test]
+fn layer_mask_controls_paint_at_display_coordinates_and_undo_one_gesture() {
+    let mut h = Harness::new(1);
+    h.app.photos[0].edit.settings.exposure = 0.5;
+    h.app.photos[0].edit.sync_active_layer();
+    h.app.inspector = Some(Inspector::Layers);
+    h.frame(vec![], Modifiers::NONE);
+    h.click("layer-add-mask", Modifiers::NONE);
+    assert!(h.app.photos[0].edit.active_layer().unwrap().mask.is_some());
+    h.frame(vec![], Modifiers::NONE);
+    h.click("layer-paint-mask", Modifiers::NONE);
+    assert_eq!(h.app.brush, Some(Target::LayerMask));
+    h.app.show_mask = false;
+    h.app.photos[0].view.fit = false;
+    h.app.photos[0].view.scale = 0.9;
+    h.app.photos[0]
+        .edit
+        .warps
+        .push(crate::geometry::WarpStroke {
+            center: [0.5, 0.5],
+            delta: [0.04, 0.0],
+            radius: 0.25,
+            softness: 0.6,
+            strength: 100.0,
+        });
+    h.frame(vec![], Modifiers::NONE);
+    let before = h.app.photos[0].edit.clone();
+    let depth = h.app.photos[0].history.depths().0;
+    let rect = h.rect("image");
+    let start = rect.intersect(h.rect("canvas")).center();
+    let end = start + vec2(18.0, 12.0);
+    h.drag(start, end);
+    let mask = h.app.photos[0]
+        .edit
+        .active_layer()
+        .unwrap()
+        .mask
+        .as_ref()
+        .unwrap();
+    assert!(!mask.strokes.is_empty());
+    let uv = [
+        (start.x - rect.left()) / rect.width(),
+        (start.y - rect.top()) / rect.height(),
+    ];
+    assert!((mask.strokes[0].center[0] - uv[0]).abs() < 0.0001);
+    assert!((mask.strokes[0].center[1] - uv[1]).abs() < 0.0001);
+    assert!(mask.sample_uv(uv, (420, 640)) < 255);
+    assert_eq!(h.app.photos[0].history.depths().0, depth + 1);
+    let painted = h.app.photos[0].edit.clone();
+    h.app.undo(&h.ctx);
+    assert_eq!(h.app.photos[0].edit, before);
+    h.app.redo(&h.ctx);
+    assert_eq!(h.app.photos[0].edit, painted);
+    h.frame(vec![], Modifiers::NONE);
+    h.click("layer-invert-mask", Modifiers::NONE);
+    assert_eq!(
+        h.app.photos[0]
+            .edit
+            .active_layer()
+            .unwrap()
+            .mask
+            .as_ref()
+            .unwrap()
+            .base,
+        0
+    );
+    h.click("layer-remove-mask", Modifiers::NONE);
+    assert!(h.app.photos[0].edit.active_layer().unwrap().mask.is_none());
+    assert_eq!(h.app.brush, None);
+}
+
+#[test]
+fn visible_sampling_control_is_saved_per_layer_and_undoable() {
+    let mut h = Harness::new(1);
+    h.app.brush = Some(Target::Heal);
+    h.frame(vec![], Modifiers::NONE);
+    let before = h.app.photos[0].edit.clone();
+    h.click("sample-visible-layers", Modifiers::NONE);
+    assert!(h.app.photos[0].edit.active_layer().unwrap().sample_visible);
+    h.app.undo(&h.ctx);
+    assert_eq!(h.app.photos[0].edit, before);
+    h.app.redo(&h.ctx);
+    let saved = ron::ser::to_string(&h.app.photos[0].edit).unwrap();
+    assert!(
+        ron::from_str::<Edit>(&saved)
+            .unwrap()
+            .active_layer()
+            .unwrap()
+            .sample_visible
+    );
+}
+
+#[test]
+fn manual_target_checks_respect_partial_masks_and_offer_reveal_for_an_empty_black_mask() {
+    let mut h = Harness::new(1);
+    h.app.brush = Some(Target::Heal);
+    let upper = h.app.photos[0].edit.add_layer(LayerType::OriginalCopy);
+    h.app.photos[0].edit.active_layer_mut().unwrap().mask = Some(crate::layer_mask::LayerMask {
+        base: 0,
+        ..Default::default()
+    });
+    h.app.photos[0].edit.select_layer(1);
+    assert!(
+        !h.app.manual_blocked(),
+        "Masked upper image copy should allow lower edits"
+    );
+    h.app.photos[0].edit.select_layer(upper);
+    assert!(h.app.manual_blocked());
+    h.frame(vec![], Modifiers::NONE);
+    h.click("manual-target-fix", Modifiers::NONE);
+    assert_eq!(
+        h.app.photos[0]
+            .edit
+            .active_layer()
+            .unwrap()
+            .mask
+            .as_ref()
+            .unwrap()
+            .base,
+        255
+    );
+    assert!(!h.app.manual_blocked());
+}
+
+#[test]
 fn staged_import_preserves_active_photo_and_deleted_assets_reject_late_loads() {
     let directory = tempfile::tempdir().unwrap();
     let paths: Vec<_> = (0..2)
@@ -3530,6 +3654,66 @@ fn native_button_requests_original_and_displays_exact_source_pixels() {
         tile.original.get_pixel(0, 0),
         source.get_pixel(tile.key.3.x, tile.key.3.y)
     );
+}
+
+#[test]
+fn native_short_click_renders_the_sharp_canvas_before_the_overview() {
+    let mut h = Harness::new(1);
+    let p = &mut h.app.photos[0];
+    p.photo = engine::photo_from_image(
+        "native-click.png".into(),
+        None,
+        RgbaImage::from_pixel(1800, 2100, image::Rgba([90, 105, 120, 255])),
+    );
+    p.view.fit = false;
+    p.view.scale = 0.9;
+    p.rendered_revision = p.revision;
+    h.app.brush = Some(Target::Heal);
+    h.frame(vec![], Modifiers::NONE);
+    h.jobs.try_iter().for_each(drop);
+    let pos = h.rect("canvas").center();
+    h.frame(
+        vec![
+            Event::PointerMoved(pos),
+            primary(pos, true, Modifiers::NONE),
+            primary(pos, false, Modifiers::NONE),
+        ],
+        Modifiers::NONE,
+    );
+    let revision = h.app.photos[0].revision;
+    let jobs: Vec<_> = h.jobs.try_iter().collect();
+    let (id, crop) = jobs
+        .iter()
+        .find_map(|job| match job {
+            Job::DetailRegion {
+                id,
+                revision: rev,
+                crop,
+                ..
+            } if *rev == revision => Some((*id, *crop)),
+            _ => None,
+        })
+        .expect("A short click must request native feedback immediately");
+    assert!(
+        !jobs.iter().any(|job| matches!(
+            job,
+            Job::Render {
+                kind: RenderKind::Preview,
+                ..
+            }
+        )),
+        "Overview must wait for the native frame"
+    );
+    h.incoming
+        .send(Message::DetailRegionRendered {
+            id,
+            revision,
+            crop,
+            image: RgbaImage::from_pixel(crop.width, crop.height, image::Rgba([91, 105, 120, 255])),
+        })
+        .unwrap();
+    h.frame(vec![], Modifiers::NONE);
+    assert!(h.jobs.try_iter().any(|job| matches!(job, Job::Render { kind: RenderKind::Preview, revision: rev, .. } if rev == revision)));
 }
 
 #[test]

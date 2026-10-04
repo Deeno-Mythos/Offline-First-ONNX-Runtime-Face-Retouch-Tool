@@ -2271,7 +2271,15 @@ impl History {
                 .layers
                 .iter()
                 .zip(b.stack.layers.iter())
-                .all(|(a, b)| a.id == b.id && Self::same_action_storage(&a.edit, &b.edit))
+                .all(|(a, b)| {
+                    a.id == b.id
+                        && match (&a.mask, &b.mask) {
+                            (Some(a), Some(b)) => a.strokes.same_storage(&b.strokes),
+                            (None, None) => true,
+                            _ => false,
+                        }
+                        && Self::same_action_storage(&a.edit, &b.edit)
+                })
     }
     /// Snapshots contain edit instructions, never full-resolution pixels.
     pub fn snapshots(&self) -> (impl Iterator<Item = &Edit>, impl Iterator<Item = &Edit>) {
@@ -2318,6 +2326,18 @@ impl History {
             if snapshot.patches == current.patches {
                 current.patches = snapshot.patches.clone();
             }
+            for layer in current.stack.layers.iter_mut() {
+                if let Some(saved) = snapshot
+                    .stack
+                    .layers
+                    .iter()
+                    .find(|saved| saved.id == layer.id)
+                    && let (Some(saved), Some(mask)) = (&saved.mask, &mut layer.mask)
+                    && saved.strokes == mask.strokes
+                {
+                    mask.strokes = saved.strokes.clone();
+                }
+            }
         }
     }
     /// Counts each shared action allocation once, including lasso boundaries. Pixel caches are
@@ -2339,6 +2359,11 @@ impl History {
             bytes += edit.stack.solo.as_ref().map_or(0, |solo| {
                 solo.visibility.capacity() * std::mem::size_of::<(u64, bool)>()
             });
+            for layer in &edit.stack.layers {
+                if let Some(mask) = &layer.mask {
+                    bytes += allocation(&mask.strokes, &mut seen);
+                }
+            }
             for edit in edits {
                 bytes += allocation(&edit.strokes, &mut seen);
                 bytes += allocation(&edit.warps, &mut seen);
@@ -2522,7 +2547,9 @@ fn render_pixels(pass: PixelPass<'_>) -> Vec<u8> {
                 let repair = seg
                     .filter(|seg| s.blemishes != 0.0 && !seg.repair_delta.is_empty())
                     .map(|seg| sample_seg_rgb(&seg.repair_delta, seg, uv[0], uv[1], 0.0));
-                let before_targeted_luma = lum(&p);
+                let eye_active = s.under_eyes > 0.0 && masks[3] > 0.0;
+                let without_eye = (forehead * s.forehead + laugh * s.laugh_lines) / 100.0;
+                let mut eye_baseline = p;
                 for c in 0..3 {
                     if let Some(delta) = repair
                         && delta[c] != 0.0
@@ -2531,35 +2558,46 @@ fn render_pixels(pass: PixelPass<'_>) -> Vec<u8> {
                             (linear_to_srgb(p[c]) + delta[c] * s.blemishes / 100.0).clamp(0.0, 1.0);
                         p[c] = srgb_to_linear(corrected);
                     }
-                    if let Some(blend) = neural {
-                        let value = linear_to_srgb(p[c]).clamp(0.0, 1.0);
-                        let strength =
-                            (skin * s.smoothing / 100.0 + targeted * 0.8).clamp(0.0, 1.0);
-                        let mg = 0.5 + (blend[c] - 0.5) * strength;
-                        p[c] = srgb_to_linear(
-                            ((1.0 - 2.0 * mg) * value * value + 2.0 * mg * value).clamp(0.0, 1.0),
-                        );
+                    let texture_value = |mut channel: f32, targeted: f32| {
+                        if let Some(blend) = neural {
+                            let value = linear_to_srgb(channel).clamp(0.0, 1.0);
+                            let strength =
+                                (skin * s.smoothing / 100.0 + targeted * 0.8).clamp(0.0, 1.0);
+                            let mg = 0.5 + (blend[c] - 0.5) * strength;
+                            channel = srgb_to_linear(
+                                ((1.0 - 2.0 * mg) * value * value + 2.0 * mg * value)
+                                    .clamp(0.0, 1.0),
+                            );
+                        }
+                        let soften = (skin * s.smoothing / 100.0 * 0.95 + targeted).clamp(0.0, 1.0);
+                        channel -= (fine[c] - low[c]) * soften * (1.0 - edge * 0.6);
+                        channel -= (linear[i][c] - fine[c])
+                            * (skin * s.smoothing / 100.0 * 0.28 + targeted * 0.4).clamp(0.0, 0.6)
+                            * (1.0 - edge * 0.6);
+                        lerp(
+                            channel,
+                            low[c] + linear[i][c] - fine[c],
+                            skin * s.tone_evenness / 100.0 * 0.65 * (1.0 - edge),
+                        )
+                    };
+                    if eye_active {
+                        eye_baseline[c] = texture_value(p[c], without_eye);
                     }
-                    // Separate medium-scale unevenness from fine texture; full strength is deliberately visible.
-                    let soften = (skin * s.smoothing / 100.0 * 0.95 + targeted).clamp(0.0, 1.0);
-                    p[c] -= (fine[c] - low[c]) * soften * (1.0 - edge * 0.6);
-                    p[c] -= (linear[i][c] - fine[c])
-                        * (skin * s.smoothing / 100.0 * 0.28 + targeted * 0.4).clamp(0.0, 0.6)
-                        * (1.0 - edge * 0.6);
-                    p[c] = lerp(
-                        p[c],
-                        low[c] + linear[i][c] - fine[c],
-                        skin * s.tone_evenness / 100.0 * 0.65 * (1.0 - edge),
-                    );
+                    p[c] = texture_value(p[c], targeted);
                 }
                 // Under-eye smoothing should not deepen a shadow when the neural blend
                 // or local blur disagrees with the cheek reference.
-                if s.under_eyes > 0.0 && masks[3] > 0.0 && targeted > 0.0 {
+                if eye_active {
                     let after = lum(&p);
-                    if after < before_targeted_luma && after > 0.0001 {
-                        let scale = before_targeted_luma / after;
-                        for channel in &mut p[..3] {
-                            *channel *= scale;
+                    let baseline = lum(&eye_baseline);
+                    if after < baseline {
+                        if after > 0.0001 {
+                            let scale = baseline / after;
+                            for channel in &mut p[..3] {
+                                *channel *= scale;
+                            }
+                        } else {
+                            p[..3].copy_from_slice(&eye_baseline[..3]);
                         }
                     }
                 }
@@ -2635,6 +2673,123 @@ fn render_pixels(pass: PixelPass<'_>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn layer_mask_history_counts_unique_strokes_and_shares_reopened_storage() {
+        use crate::layer_mask::{LayerMask, MaskStroke};
+        let mut edit = Edit::default();
+        edit.ensure_stack();
+        let mut baseline = History::default();
+        baseline.record(edit.clone());
+        edit.active_layer_mut().unwrap().mask = Some(LayerMask {
+            strokes: vec![
+                MaskStroke {
+                    center: [0.5, 0.5],
+                    radius: 0.01,
+                    softness: 0.7,
+                    strength: 100.0,
+                    reveal: false
+                };
+                128
+            ]
+            .into(),
+            ..Default::default()
+        });
+        let mut history = History::default();
+        history.record(edit.clone());
+        let bytes = history.instruction_storage_bytes();
+        assert!(
+            bytes >= baseline.instruction_storage_bytes() + 128 * std::mem::size_of::<MaskStroke>()
+        );
+        history.record(edit.clone());
+        assert_eq!(history.instruction_storage_bytes(), bytes);
+        let mut reopened: Edit = ron::from_str(&ron::to_string(&edit).unwrap()).unwrap();
+        assert!(
+            !edit
+                .active_layer()
+                .unwrap()
+                .mask
+                .as_ref()
+                .unwrap()
+                .strokes
+                .same_storage(
+                    &reopened
+                        .active_layer()
+                        .unwrap()
+                        .mask
+                        .as_ref()
+                        .unwrap()
+                        .strokes
+                )
+        );
+        history.share_current_storage(&mut reopened);
+        assert!(
+            edit.active_layer()
+                .unwrap()
+                .mask
+                .as_ref()
+                .unwrap()
+                .strokes
+                .same_storage(
+                    &reopened
+                        .active_layer()
+                        .unwrap()
+                        .mask
+                        .as_ref()
+                        .unwrap()
+                        .strokes
+                )
+        );
+        let mut next = edit.clone();
+        next.active_layer_mut()
+            .unwrap()
+            .mask
+            .as_mut()
+            .unwrap()
+            .strokes
+            .push(MaskStroke {
+                center: [0.6, 0.5],
+                radius: 0.01,
+                softness: 0.7,
+                strength: 100.0,
+                reveal: false,
+            });
+        history.record(next.clone());
+        assert!(history.instruction_storage_bytes() > bytes);
+        assert!(history.undo(&mut next));
+        assert_eq!(
+            next.active_layer()
+                .unwrap()
+                .mask
+                .as_ref()
+                .unwrap()
+                .strokes
+                .len(),
+            129
+        );
+        assert!(history.undo(&mut next));
+        assert_eq!(
+            next.active_layer()
+                .unwrap()
+                .mask
+                .as_ref()
+                .unwrap()
+                .strokes
+                .len(),
+            128
+        );
+        assert!(history.redo(&mut next));
+        assert_eq!(
+            next.active_layer()
+                .unwrap()
+                .mask
+                .as_ref()
+                .unwrap()
+                .strokes
+                .len(),
+            129
+        );
+    }
+
     #[test]
     fn every_tool_layer_can_restore_original_pixels_in_full_native_and_cached_renders() {
         use crate::{
@@ -3462,6 +3617,46 @@ mod tests {
         let reused = &renderer.sources[0].under_eye_lift.as_ref().unwrap().data;
         assert!(Arc::ptr_eq(&lift, reused));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn under_eye_neural_smoothing_cannot_deepen_shadows_and_keeps_user_exposure() {
+        let image = Arc::new(RgbaImage::from_fn(96, 112, |x, y| {
+            let v = 60 + ((x * 3 + y * 5) % 45) as u8;
+            image::Rgba([v, v, v, 255])
+        }));
+        let seg = Arc::new(Segmentation {
+            width: 96,
+            height: 112,
+            under_eyes: vec![0.8; 96 * 112].into(),
+            neural_blend: vec![[0.25; 3]; 96 * 112].into(),
+            ..Default::default()
+        });
+        let mut edit = Edit::default();
+        edit.settings.exposure = -0.5;
+        let mut renderer = Renderer::default();
+        let baseline = renderer.render(&image, &edit, Some(&seg), None).unwrap();
+        edit.settings.under_eyes = 100.0;
+        let treated = renderer.render(&image, &edit, Some(&seg), None).unwrap();
+        for (before, after) in baseline.pixels().zip(treated.pixels()) {
+            assert!(after[0] >= before[0]);
+        }
+        assert!(
+            treated.get_pixel(0, 0)[0] < image.get_pixel(0, 0)[0],
+            "User exposure should still apply"
+        );
+        let crop = Crop {
+            x: 17,
+            y: 22,
+            width: 45,
+            height: 53,
+        };
+        assert_eq!(
+            renderer
+                .render_region(&image, &edit, Some(&seg), crop, None)
+                .unwrap(),
+            image::imageops::crop_imm(&treated, crop.x, crop.y, crop.width, crop.height).to_image()
+        );
     }
 
     #[test]

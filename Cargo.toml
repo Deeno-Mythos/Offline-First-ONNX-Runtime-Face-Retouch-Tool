@@ -1,6 +1,6 @@
 [package]
 name = "hastur-retouch"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 edition = "2024"
 rust-version = "1.95"
 description = "A natural, non-destructive portrait retouching studio"
@@ -8,7 +8,7 @@ license = "MIT"
 
 [features]
 default = ["onnx"]
-onnx = ["dep:ort", "dep:ndarray", "dep:burn", "dep:burn-store", "dep:burn-onnx"]
+onnx = ["dep:ort", "dep:ndarray", "dep:burn", "dep:burn-store", "dep:burn-onnx", "dep:sha2"]
 
 [dependencies]
 eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
@@ -35,6 +35,7 @@ windows = { version = "0.61.3", features = ["Win32_Graphics_Imaging", "Win32_Sys
 
 [build-dependencies]
 burn-onnx = { version = "=0.22.0-pre.4", default-features = false, features = ["import"], optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

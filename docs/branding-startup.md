@@ -60,7 +60,7 @@ photo maps and edits remain usable.
 remain usable. New recovery files use `%LOCALAPPDATA%\HasturRetouch\recovery`,
 while older `%LOCALAPPDATA%\AstraRetouch\recovery` workspaces remain discoverable.
 `HASTUR_RECOVERY_DIR` takes precedence over the supported `ASTRA_RECOVERY_DIR`.
-New neural caches use `.hastur-cache`; `.astra-cache` remains a read fallback.
+New neural caches use `%LOCALAPPDATA%\HasturRetouch\ai-cache`; older `.hastur-cache` and `.astra-cache` beside the models remain read fallbacks.
 Stable cache signatures and generated model-pack paths preserve compatibility.
 See [recovery details](workspace-recovery.md).
 

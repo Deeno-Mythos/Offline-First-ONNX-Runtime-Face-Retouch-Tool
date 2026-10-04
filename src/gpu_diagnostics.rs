@@ -54,6 +54,152 @@ pub struct UploadSample {
     pub complete_ms: f64,
     pub pixels: u64,
 }
+
+/// Exercises the same egui tessellation, canvas callback, GPU submission and
+/// texture path as the app. Completion excludes physical display refresh.
+pub struct FrameProfiler {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    renderer: egui_wgpu::Renderer,
+    target: wgpu::Texture,
+    size: [u32; 2],
+    pub adapter: String,
+}
+impl FrameProfiler {
+    pub fn new(size: [u32; 2]) -> Result<Self> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))??;
+        let info = adapter.get_info();
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Hastur input feedback profiler"),
+            ..Default::default()
+        }))??;
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut renderer =
+            egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::PREDICTABLE);
+        renderer
+            .callback_resources
+            .insert(canvas_resources(&device, format));
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Hastur feedback framebuffer"),
+            size: wgpu::Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        Ok(Self {
+            device,
+            queue,
+            renderer,
+            target,
+            size,
+            adapter: format!("{} / {:?}", info.name, info.backend),
+        })
+    }
+    pub fn frame(&mut self, ctx: &egui::Context, output: egui::FullOutput) -> Result<f64> {
+        let start = Instant::now();
+        let screen = ScreenDescriptor {
+            size_in_pixels: self.size,
+            pixels_per_point: output.pixels_per_point,
+        };
+        let paint = ctx.tessellate(output.shapes, output.pixels_per_point);
+        for (id, delta) in &output.textures_delta.set {
+            self.renderer
+                .update_texture(&self.device, &self.queue, *id, delta);
+        }
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let commands =
+            self.renderer
+                .update_buffers(&self.device, &self.queue, &mut encoder, &paint, &screen);
+        let view = self.target.create_view(&Default::default());
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Hastur feedback frame"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            self.renderer
+                .render(&mut pass.forget_lifetime(), &paint, &screen);
+        }
+        let submission = self
+            .queue
+            .submit(commands.into_iter().chain([encoder.finish()]));
+        self.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: Some(Duration::from_secs(5)),
+        })?;
+        for id in &output.textures_delta.free {
+            self.renderer.free_texture(id);
+        }
+        Ok(start.elapsed().as_secs_f64() * 1000.0)
+    }
+    pub fn screenshot(&self) -> Result<RgbaImage> {
+        let [w, h] = self.size;
+        let stride = (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: stride as u64 * h as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = self.queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+        self.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: Some(Duration::from_secs(5)),
+        })?;
+        rx.recv_timeout(Duration::from_secs(5))??;
+        let data = buffer.slice(..).get_mapped_range();
+        let bytes = data
+            .chunks(stride as usize)
+            .flat_map(|row| row[..w as usize * 4].iter().copied())
+            .collect();
+        RgbaImage::from_raw(w, h, bytes).context("Invalid framebuffer")
+    }
+}
 pub struct UploadProfiler {
     device: wgpu::Device,
     queue: wgpu::Queue,

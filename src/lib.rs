@@ -9,6 +9,8 @@ pub mod engine;
 pub mod flyaway;
 pub mod geometry;
 pub mod gpu;
+#[doc(hidden)]
+pub mod installation_check;
 pub mod interaction;
 pub mod layer_mask;
 pub mod layer_stack;

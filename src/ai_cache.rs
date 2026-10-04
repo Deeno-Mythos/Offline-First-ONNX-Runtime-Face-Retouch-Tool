@@ -89,7 +89,26 @@ fn remember(path: PathBuf, seg: &Segmentation, provider: crate::model::Provider)
         cache.pop_front();
     }
 }
-fn paths(image: &RgbaImage, provider: crate::model::Provider) -> Option<[PathBuf; 2]> {
+pub(crate) fn directory() -> PathBuf {
+    std::env::var_os("HASTUR_AI_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join("HasturRetouch")
+                .join("ai-cache")
+        })
+}
+fn cache_paths(current: &Path, legacy_root: &Path, filename: &str) -> [PathBuf; 3] {
+    [
+        current.join(filename),
+        legacy_root.join(".hastur-cache").join(filename),
+        legacy_root.join(".astra-cache").join(filename),
+    ]
+}
+fn paths(image: &RgbaImage, provider: crate::model::Provider) -> Option<[PathBuf; 3]> {
     let mut hash = 0xcbf29ce484222325u64;
     let mut update = |data: &[u8]| {
         for b in data {
@@ -120,10 +139,7 @@ fn paths(image: &RgbaImage, provider: crate::model::Provider) -> Option<[PathBuf
     let model = model::model_path(MODELS[0]);
     let root = model.parent()?.parent()?;
     let filename = format!("{hash:016x}.bin");
-    Some([
-        root.join(".hastur-cache").join(&filename),
-        root.join(".astra-cache").join(filename),
-    ])
+    Some(cache_paths(&directory(), root, &filename))
 }
 pub fn load(image: &RgbaImage, provider: crate::model::Provider) -> Option<Segmentation> {
     load_paths(&paths(image, provider)?, image.dimensions(), provider)
@@ -391,7 +407,7 @@ fn write_values(writer: &mut impl Write, data: &[f32]) -> Result<()> {
     Ok(())
 }
 pub fn save(image: &RgbaImage, seg: &Segmentation, provider: crate::model::Provider) -> Result<()> {
-    let Some([path, _]) = paths(image, provider) else {
+    let Some([path, ..]) = paths(image, provider) else {
         return Ok(());
     };
     let dir = path.parent().unwrap();
@@ -437,6 +453,17 @@ fn trim(dir: &Path, current: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn installed_cache_writes_are_separate_from_read_only_legacy_models() {
+        let paths = cache_paths(
+            Path::new("user/cache"),
+            Path::new("installed"),
+            "fixture.bin",
+        );
+        assert_eq!(paths[0], Path::new("user/cache/fixture.bin"));
+        assert_eq!(paths[1], Path::new("installed/.hastur-cache/fixture.bin"));
+        assert_eq!(paths[2], Path::new("installed/.astra-cache/fixture.bin"));
+    }
     #[test]
     fn legacy_cache_is_a_read_only_fallback_and_new_valid_cache_takes_precedence() {
         let directory = tempfile::tempdir().unwrap();

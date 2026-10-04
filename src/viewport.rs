@@ -98,6 +98,29 @@ fn manual_damage(
     let new = after.resolved_layers();
     let (a, b) = match (old.split_last(), new.split_last()) {
         (Some((a, below)), Some((b, next))) if below == next => {
+            // A sampled lower layer can copy changed upper pixels into a
+            // distant destination. Its dependency exceeds the top footprint.
+            if below.iter().any(|layer| layer.sample_visible) {
+                return None;
+            }
+            if a.mask != b.mask {
+                let mut meta = b.clone();
+                meta.mask = a.mask.clone();
+                if meta != *a {
+                    return None;
+                }
+                let (old_mask, new_mask) = (a.mask.as_ref()?, b.mask.as_ref()?);
+                if old_mask.base != new_mask.base
+                    || !new_mask.strokes.starts_with(&old_mask.strokes)
+                {
+                    return None;
+                }
+                let mut destination = Bounds::default();
+                for stroke in &new_mask.strokes[old_mask.strokes.len()..] {
+                    destination.point(stroke.center, stroke.radius, dims);
+                }
+                return Some(intersect(destination.crop(dims, [1.0, 1.0]), crop));
+            }
             let mut meta = b.clone();
             meta.edit = a.edit.clone();
             if meta != *a {
@@ -243,7 +266,18 @@ impl Renderer {
             self.viewport = Some(frame);
             return Ok(result);
         }
-        let result = self.render_region(image, edit, seg, crop, cancel)?;
+        // Whole-overview preparation is faster through the complete renderer's
+        // image/filter caches. Warm the bounded frame there, then redraw local
+        // damage through the region path on subsequent updates.
+        let result = if crop.x == 0
+            && crop.y == 0
+            && crop.width == image.width()
+            && crop.height == image.height()
+        {
+            self.render(image, edit, seg, cancel)?
+        } else {
+            self.render_region(image, edit, seg, crop, cancel)?
+        };
         if result.as_raw().len() <= FRAME_BYTES {
             self.viewport = Some(FrameCache {
                 source: Arc::downgrade(image),
@@ -271,6 +305,53 @@ mod tests {
         geometry::WarpStroke,
         layer_stack::LayerType,
     };
+
+    #[test]
+    fn upper_edits_redraw_remote_lower_visible_sampling_destinations() {
+        let source = Arc::new(RgbaImage::from_fn(200, 160, |x, _| {
+            let value = if x > 165 { 210 } else { 60 };
+            image::Rgba([value, value, value, 255])
+        }));
+        let crop = Crop {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 160,
+        };
+        let mut edit = Edit::default();
+        edit.ensure_stack();
+        edit.active_layer_mut().unwrap().sample_visible = true;
+        edit.clones.push(CloneStamp {
+            center: [0.25, 0.5],
+            source: [0.75, 0.5],
+            radius: 0.04,
+            softness: 0.0,
+            strength: 100.0,
+        });
+        edit.add_layer(LayerType::Retouch);
+        let mut renderer = Renderer::default();
+        let before = renderer
+            .render_viewport(&source, &edit, None, crop, None)
+            .unwrap();
+        edit.clones.push(CloneStamp {
+            center: [0.75, 0.5],
+            source: [0.9, 0.5],
+            radius: 0.05,
+            softness: 0.0,
+            strength: 100.0,
+        });
+        let after = renderer
+            .render_viewport(&source, &edit, None, crop, None)
+            .unwrap();
+        assert_ne!(before.get_pixel(50, 80), after.get_pixel(50, 80));
+        assert_eq!(
+            after,
+            Renderer::default()
+                .render(&source, &edit, None, None)
+                .unwrap()
+        );
+        assert_eq!(renderer.viewport_damage(), Some(crop));
+    }
 
     fn fixture() -> (Arc<RgbaImage>, Crop) {
         let image = RgbaImage::from_fn(1234, 913, |x, y| {
@@ -418,6 +499,50 @@ mod tests {
         }
         verify(&mut renderer, &image, &edit, Some(&seg), crop);
     }
+    #[test]
+    fn appended_layer_mask_strokes_redraw_only_their_output_footprint() {
+        let (image, crop) = fixture();
+        let mut edit = Edit::default();
+        edit.settings.exposure = 0.4;
+        edit.ensure_stack();
+        edit.active_layer_mut().unwrap().mask = Some(crate::layer_mask::LayerMask::default());
+        let mut renderer = Renderer::default();
+        renderer
+            .render_viewport(&image, &edit, None, crop, None)
+            .unwrap();
+        for (center, reveal) in [
+            ([0.45, 0.47], false),
+            ([0.47, 0.48], false),
+            ([0.45, 0.47], true),
+        ] {
+            edit.active_layer_mut()
+                .unwrap()
+                .mask
+                .as_mut()
+                .unwrap()
+                .strokes
+                .push(crate::layer_mask::MaskStroke {
+                    center,
+                    radius: 0.025,
+                    softness: 0.7,
+                    strength: 75.0,
+                    reveal,
+                });
+            let actual = renderer
+                .render_viewport(&image, &edit, None, crop, None)
+                .unwrap();
+            let expected = Renderer::default()
+                .render_region(&image, &edit, None, crop, None)
+                .unwrap();
+            assert!(
+                actual == expected,
+                "Mask footprint update changed native pixels"
+            );
+            let damage = renderer.viewport_damage().unwrap();
+            assert!(damage.width * damage.height < crop.width * crop.height / 10);
+        }
+    }
+
     #[test]
     fn structural_changes_undo_pan_source_and_segmentation_rebuild_the_viewport() {
         let (image, crop) = fixture();
