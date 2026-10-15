@@ -21,6 +21,9 @@ The full portrait is displayed without cropping or stretching. This integration
 applies no retouching, grading, face edits, model training, or regenerated imagery
 to the supplied PNG. The asset generator prepares crown derivatives only.
 
+Beta cleanup removed the byte-identical copy from `example-img`; the preserved
+`assets/demo-portrait.png` remains the embedded startup portrait and review fixture.
+
 Rebuild the assets with a Pillow-enabled Python:
 
 ```powershell

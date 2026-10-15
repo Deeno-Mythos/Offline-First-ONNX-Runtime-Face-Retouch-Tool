@@ -44,8 +44,50 @@ fn embed_windows_icon() {
         return;
     }
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let script = root.join("assets/branding/icon.rc");
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let version = env::var("CARGO_PKG_VERSION").unwrap();
+    let components = ["MAJOR", "MINOR", "PATCH"]
+        .map(|part| env::var(format!("CARGO_PKG_VERSION_{part}")).unwrap());
+    let revision = env::var("CARGO_PKG_VERSION_PRE")
+        .ok()
+        .and_then(|pre| pre.rsplit('.').next()?.parse::<u16>().ok())
+        .unwrap_or(0);
+    let numeric = format!(
+        "{},{},{},{revision}",
+        components[0], components[1], components[2]
+    );
+    let icon = std::fs::read_to_string(root.join("assets/branding/icon.rc")).unwrap();
+    let script = out.join("hastur-version.rc");
+    std::fs::write(
+        &script,
+        format!(
+            r#"{icon}
+1 VERSIONINFO
+FILEVERSION {numeric}
+PRODUCTVERSION {numeric}
+FILEOS 0x40004
+FILETYPE 1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "Hastur Retouch"
+      VALUE "FileVersion", "{version}"
+      VALUE "ProductName", "Hastur Retouch"
+      VALUE "ProductVersion", "{version}"
+      VALUE "OriginalFilename", "hastur-retouch.exe"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END
+"#
+        ),
+    )
+    .expect("write executable version resource");
     let msvc = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     let resource = out.join(if msvc {
         "hastur-icon.res"
@@ -223,11 +265,36 @@ fn generate_models() {
     let generated_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("astra_burn");
     let runtime_dir = model_dir.join("burn");
     fs::create_dir_all(&runtime_dir).expect("create Burn model directory");
+    let mut provenance = String::from("# ONNX SHA-256, Burn pack SHA-256, model name\n");
     for model in MODELS {
         let pack = format!("{model}.bpk");
-        fs::copy(generated_dir.join(&pack), runtime_dir.join(pack))
+        fs::copy(generated_dir.join(&pack), runtime_dir.join(&pack))
             .expect("copy generated Burn model pack");
+        provenance.push_str(&format!(
+            "{} {} {model}\n",
+            file_sha256(&model_dir.join(format!("{model}.onnx"))),
+            file_sha256(&runtime_dir.join(pack))
+        ));
     }
+    fs::write(runtime_dir.join("provenance.txt"), provenance)
+        .expect("write Burn input/pack provenance");
 
     println!("cargo:rustc-cfg=astra_burn_models");
+}
+
+#[cfg(feature = "onnx")]
+fn file_sha256(path: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = fs::File::open(path).expect("open model for provenance");
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = file.read(&mut buffer).expect("read model for provenance");
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    format!("{:x}", hash.finalize())
 }

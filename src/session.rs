@@ -12,7 +12,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Session {
@@ -73,11 +73,15 @@ pub(crate) fn read(path: &Path) -> Result<Session> {
 }
 
 fn validate_stack(edit: &Edit) -> Result<()> {
+    edit.transform.validate()?;
     ensure!(edit.stack.layers.len() <= 32, "Too many image layers");
     let mut ids = std::collections::HashSet::new();
     for layer in &edit.stack.layers {
         ensure!(
-            layer.id > 0 && ids.insert(layer.id) && layer.edit.stack.layers.is_empty(),
+            layer.id > 0
+                && ids.insert(layer.id)
+                && layer.edit.stack.layers.is_empty()
+                && layer.edit.transform == Default::default(),
             "Invalid or nested image layer"
         );
     }
@@ -145,6 +149,8 @@ mod compact_history {
     }
     #[derive(Serialize, Deserialize)]
     struct Snapshot {
+        #[serde(default)]
+        transform: crate::image_transform::ImageTransform,
         settings: Settings,
         #[serde(default)]
         layers: crate::layers::LayerControls,
@@ -224,6 +230,7 @@ mod compact_history {
         };
         let (mut strokes, mut warps, mut clones, mut patches) = (vec![], vec![], vec![], vec![]);
         let mut snapshot = |edit: &Edit| Snapshot {
+            transform: edit.transform,
             settings: edit.settings.clone(),
             layers: edit.layers.clone(),
             stack: edit.stack.clone(),
@@ -249,6 +256,7 @@ mod compact_history {
         let patches = expand(packed.patches).map_err(D::Error::custom)?;
         let snapshot = |saved: Snapshot| -> Result<Edit, D::Error> {
             Ok(Edit {
+                transform: saved.transform,
                 settings: saved.settings,
                 layers: saved.layers,
                 stack: saved.stack,
@@ -481,6 +489,45 @@ mod tests {
         }
     }
     #[test]
+    fn document_size_rotation_and_history_survive_reopening() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("transforms.ron");
+        let mut session = fixture();
+        let p = &mut session.photos[0];
+        p.history.record(p.edit.clone());
+        p.edit.transform.size = Some([640, 960]);
+        let sized = p.edit.clone();
+        p.history.record(p.edit.clone());
+        p.edit.transform = p.edit.transform.rotated(1);
+        p.edit.transform.angle = 27.;
+        p.edit.transform.crop = Some(crate::image_transform::CropFrame {
+            center: [0.45, 0.6],
+            extent: [0.6, 0.5],
+            angle: 16.,
+        });
+        let rotated = p.edit.clone();
+        p.history.undo(&mut p.edit);
+        save(&path, &session).unwrap();
+        let mut restored = read(&path).unwrap();
+        let p = &mut restored.photos[0];
+        assert_eq!(p.edit, sized);
+        assert!(p.history.redo(&mut p.edit));
+        assert_eq!(p.edit, rotated);
+        assert!(p.history.undo(&mut p.edit));
+        assert!(p.history.undo(&mut p.edit));
+        assert_eq!(p.edit.transform, Default::default());
+        // Invalid current and historical sizes must be rejected before allocating pixels.
+        restored.photos[0].edit.transform.size = Some([32768, 32768]);
+        save(&path, &restored).unwrap();
+        assert!(read(&path).is_err());
+        restored.photos[0].edit.transform = Default::default();
+        let mut invalid = Edit::default();
+        invalid.transform.size = Some([0, 12]);
+        restored.photos[0].history.record(invalid);
+        save(&path, &restored).unwrap();
+        assert!(read(&path).is_err());
+    }
+    #[test]
     fn layer_visibility_opacity_and_both_history_branches_survive_reopening() {
         use crate::layers::LayerKind;
         let directory = tempfile::tempdir().unwrap();
@@ -637,6 +684,7 @@ mod tests {
                 strength: 70.0,
             });
             photo.edit.patches.push(PatchStroke {
+                feather: None,
                 boundary: vec![[0.1, 0.2], [0.3, 0.2], [0.2, 0.3]],
                 offset: [0.2, 0.1],
                 softness: 0.5,

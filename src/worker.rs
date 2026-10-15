@@ -30,13 +30,51 @@ struct PortraitRequest {
     demand: PortraitDemand,
     base: Option<Arc<Segmentation>>,
     image: Arc<RgbaImage>,
+    focus: Option<Photo>,
+    native_source: Option<Photo>,
 }
 
 /// Keep models warm for a series of edits, then return their weights to NullState.
 const AI_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 pub enum Job {
+    PortraitSource {
+        cancel: Arc<AtomicBool>,
+        id: u64,
+        request: u64,
+        force: bool,
+        provider: Provider,
+        demand: PortraitDemand,
+        base: Option<Arc<Segmentation>>,
+        source: Photo,
+    },
+    ScoreFace {
+        id: u64,
+        request: u64,
+        source: Photo,
+        base: Option<Arc<Segmentation>>,
+        provider: Provider,
+        cancel: Arc<AtomicBool>,
+    },
+    FramePreview {
+        id: u64,
+        revision: u64,
+        source: Photo,
+        edit: Edit,
+        seg: Option<Arc<Segmentation>>,
+        cancel: Arc<AtomicBool>,
+    },
+    TransformPhoto {
+        id: u64,
+        request: u64,
+        source: Photo,
+        transform: crate::image_transform::ImageTransform,
+        cancel: Arc<AtomicBool>,
+    },
     ReleaseMemory,
+    /// A/B replay only; production workers enable incremental manual previews.
+    #[doc(hidden)]
+    DiagnosticsPreviewPolicy(bool),
     LoadAsset {
         id: u64,
         request: u64,
@@ -148,6 +186,22 @@ pub enum Job {
     },
 }
 pub enum Message {
+    FaceFocus {
+        id: u64,
+        request: u64,
+        result: anyhow::Result<crate::focus::FocusReport>,
+    },
+    FramePreview {
+        id: u64,
+        revision: u64,
+        result: anyhow::Result<RgbaImage>,
+    },
+    PhotoTransformed {
+        id: u64,
+        request: u64,
+        transform: crate::image_transform::ImageTransform,
+        result: anyhow::Result<Photo>,
+    },
     AssetCaches {
         id: u64,
         paths: Vec<PathBuf>,
@@ -254,6 +308,56 @@ pub enum Message {
     ExportReport(anyhow::Result<PathBuf>),
 }
 
+fn render_preview(
+    renderer: &mut engine::Renderer,
+    image: &Arc<RgbaImage>,
+    edit: &Edit,
+    seg: Option<&Arc<Segmentation>>,
+    cancel: &AtomicBool,
+    incremental: bool,
+) -> anyhow::Result<RgbaImage> {
+    let manual = |edit: &Edit| {
+        !edit.warps.is_empty()
+            || !edit.clones.is_empty()
+            || !edit.patches.is_empty()
+            || edit.strokes.iter().any(|stroke| {
+                matches!(
+                    stroke.target,
+                    engine::Target::Heal
+                        | engine::Target::Clothing
+                        | engine::Target::Dodge
+                        | engine::Target::Burn
+                        | engine::Target::StrayHair
+                )
+            })
+    };
+    if incremental
+        && (manual(edit)
+            || edit.stack.layers.iter().any(|layer| {
+                manual(&layer.edit)
+                    || layer
+                        .mask
+                        .as_ref()
+                        .is_some_and(|mask| !mask.strokes.is_empty())
+            }))
+    {
+        renderer.render_viewport(
+            image,
+            edit,
+            seg,
+            engine::Crop {
+                x: 0,
+                y: 0,
+                width: image.width(),
+                height: image.height(),
+            },
+            Some(cancel),
+        )
+    } else {
+        renderer.render(image, edit, seg, Some(cancel))
+    }
+}
+
 pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
     let (tx, rx) = crossbeam_channel::unbounded();
     let (out, results) = crossbeam_channel::unbounded();
@@ -266,6 +370,7 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
         .name("hastur-native-preview".into())
         .spawn(move || {
             let mut renderer = engine::Renderer::default();
+            let mut incremental = true;
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(
                     std::thread::available_parallelism()
@@ -323,7 +428,14 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
                                 crop,
                                 Some(&cancel),
                             ),
-                            None => renderer.render(&image, &edit, seg.as_ref(), Some(&cancel)),
+                            None => render_preview(
+                                &mut renderer,
+                                &image,
+                                &edit,
+                                seg.as_ref(),
+                                &cancel,
+                                incremental,
+                            ),
                         });
                         Message::PatchPreview {
                             id,
@@ -334,6 +446,11 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
                         }
                     }
                     Job::ReleaseMemory => {
+                        renderer = engine::Renderer::default();
+                        continue;
+                    }
+                    Job::DiagnosticsPreviewPolicy(enabled) => {
+                        incremental = enabled;
                         renderer = engine::Renderer::default();
                         continue;
                     }
@@ -350,6 +467,7 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
         .name("hastur-live-preview".into())
         .spawn(move || {
             let mut renderer = engine::Renderer::default();
+            let mut incremental = true;
             let threads = std::thread::available_parallelism()
                 .map_or(2, usize::from)
                 .div_ceil(2)
@@ -361,6 +479,11 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
                 .expect("cannot start live pixel workers");
             while let Ok(job) = preview_rx.recv() {
                 if matches!(job, Job::ReleaseMemory) {
+                    renderer = engine::Renderer::default();
+                    continue;
+                }
+                if let Job::DiagnosticsPreviewPolicy(enabled) = job {
+                    incremental = enabled;
                     renderer = engine::Renderer::default();
                     continue;
                 }
@@ -380,9 +503,16 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
                     let _ = preview_out.send(Message::RenderStarted { id, revision, kind });
                     preview_ctx.request_repaint();
                 }
-                let message = match pool
-                    .install(|| renderer.render(&image, &edit, seg.as_ref(), Some(&cancel)))
-                {
+                let message = match pool.install(|| {
+                    render_preview(
+                        &mut renderer,
+                        &image,
+                        &edit,
+                        seg.as_ref(),
+                        &cancel,
+                        incremental,
+                    )
+                }) {
                     Ok(image) => Message::Rendered {
                         kind,
                         id,
@@ -402,23 +532,78 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
     std::thread::Builder::new()
         .name("hastur-active-original".into())
         .spawn(move || {
-            while let Ok(Job::LoadAsset {
-                id,
-                request,
-                path,
-                cancel,
-            }) = asset_rx.recv()
-            {
-                if cancel.load(Ordering::Relaxed) {
-                    continue;
-                }
-                let result = engine::load_photo(&path);
-                if !cancel.load(Ordering::Relaxed) {
-                    let _ = asset_out.send(Message::AssetLoaded {
+            while let Ok(job) = asset_rx.recv() {
+                let (cancel, message) = match job {
+                    Job::FramePreview {
+                        id,
+                        revision,
+                        source,
+                        edit,
+                        seg,
+                        cancel,
+                    } => {
+                        if cancel.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        let result = crate::image_transform::frame_preview(
+                            &source,
+                            edit,
+                            seg.as_ref(),
+                            &cancel,
+                        );
+                        (
+                            cancel,
+                            Message::FramePreview {
+                                id,
+                                revision,
+                                result,
+                            },
+                        )
+                    }
+                    Job::LoadAsset {
                         id,
                         request,
-                        result,
-                    });
+                        path,
+                        cancel,
+                    } => {
+                        if cancel.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        let result = engine::load_photo(&path);
+                        (
+                            cancel,
+                            Message::AssetLoaded {
+                                id,
+                                request,
+                                result,
+                            },
+                        )
+                    }
+                    Job::TransformPhoto {
+                        id,
+                        request,
+                        source,
+                        transform,
+                        cancel,
+                    } => {
+                        if cancel.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        let result = source.transformed(transform, Some(&cancel));
+                        (
+                            cancel,
+                            Message::PhotoTransformed {
+                                id,
+                                request,
+                                transform,
+                                result,
+                            },
+                        )
+                    }
+                    _ => continue,
+                };
+                if !cancel.load(Ordering::Relaxed) {
+                    let _ = asset_out.send(message);
                     asset_ctx.request_repaint();
                 }
             }
@@ -429,13 +614,21 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
         .name("hastur-image-dispatch".into())
         .spawn(move || {
             while let Ok(job) = rx.recv() {
+                if let Job::DiagnosticsPreviewPolicy(enabled) = job {
+                    let _ = preview_tx.send(Job::DiagnosticsPreviewPolicy(enabled));
+                    let _ = detail_tx.send(Job::DiagnosticsPreviewPolicy(enabled));
+                    continue;
+                }
                 if matches!(job, Job::ReleaseMemory) {
                     let _ = preview_tx.send(Job::ReleaseMemory);
                     let _ = detail_tx.send(Job::ReleaseMemory);
                     let _ = background_tx.send(Job::ReleaseMemory);
                     continue;
                 }
-                let target = if matches!(job, Job::LoadAsset { .. }) {
+                let target = if matches!(
+                    job,
+                    Job::LoadAsset { .. } | Job::TransformPhoto { .. } | Job::FramePreview { .. }
+                ) {
                     &asset_tx
                 } else if matches!(
                     job,
@@ -540,15 +733,68 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
                     }
                 }
                 queue.extend(portrait_rx.try_iter());
-                let job = queue.pop_front().unwrap();
+                let mut job = queue.pop_front().unwrap();
                 if job.cancel.load(Ordering::Relaxed) {
                     continue;
                 }
-                if queue
-                    .iter()
-                    .any(|new| new.id == job.id && new.request > job.request)
-                {
+                if queue.iter().any(|new| {
+                    new.id == job.id
+                        && new.request > job.request
+                        && new.focus.is_some() == job.focus.is_some()
+                }) {
                     continue;
+                }
+                if let Some(source) = &job.focus {
+                    // Open and release one native source at a time. A batch of
+                    // staged thumbnails must not retain every original in RAM.
+                    let result = source.open_native().and_then(|native| {
+                        if job.cancel.load(Ordering::Relaxed) {
+                            return Err(engine::Cancelled.into());
+                        }
+                        let seg = if let Some(base) = job
+                            .base
+                            .as_ref()
+                            .filter(|s| s.prepared.contains(PortraitDemand::GEOMETRY))
+                        {
+                            base.clone()
+                        } else {
+                            Arc::new(model::analyze_shared_demand_cached_with_status(
+                                &native.preview,
+                                job.provider,
+                                false,
+                                PortraitDemand::GEOMETRY,
+                                job.base.as_deref(),
+                                |_| {},
+                                |_| {},
+                            )?)
+                        };
+                        if job.cancel.load(Ordering::Relaxed) {
+                            return Err(engine::Cancelled.into());
+                        }
+                        Ok(crate::focus::analyze(&native.original, &seg.faces))
+                    });
+                    let _ = portrait_out.send(Message::FaceFocus {
+                        id: job.id,
+                        request: job.request,
+                        result,
+                    });
+                    portrait_ctx.request_repaint();
+                    continue;
+                }
+                if let Some(source) = job.native_source.take() {
+                    match source.open_native() {
+                        Ok(native) => job.image = native.preview,
+                        Err(error) => {
+                            let _ = portrait_out.send(Message::PortraitReady {
+                                id: job.id,
+                                request: job.request,
+                                complete: true,
+                                result: Err(error),
+                            });
+                            portrait_ctx.request_repaint();
+                            continue;
+                        }
+                    }
                 }
                 let result = model::analyze_shared_demand_cached_with_status(
                     &job.image,
@@ -667,7 +913,10 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
                     Job::ReleaseMemory => {
                         renderer = engine::Renderer::default();
                     }
-                    Job::LoadAsset { .. } => continue,
+                    Job::LoadAsset { .. }
+                    | Job::TransformPhoto { .. }
+                    | Job::FramePreview { .. }
+                    | Job::DiagnosticsPreviewPolicy(_) => continue,
                     Job::ImportFolder(directory) => match crate::assets::folder_files(&directory) {
                         Ok(paths) => {
                             let _ = import_tx.send(paths.into_iter().take(64).map(Some).collect());
@@ -738,6 +987,52 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
                             demand,
                             base,
                             image,
+                            focus: None,
+                            native_source: None,
+                        });
+                    }
+                    Job::ScoreFace {
+                        id,
+                        request,
+                        source,
+                        base,
+                        provider,
+                        cancel,
+                    } => {
+                        let _ = portrait_tx.send(PortraitRequest {
+                            id,
+                            request,
+                            image: source.preview.clone(),
+                            focus: Some(source),
+                            native_source: None,
+                            base,
+                            provider,
+                            cancel,
+                            force: false,
+                            demand: PortraitDemand::GEOMETRY,
+                        });
+                    }
+                    Job::PortraitSource {
+                        cancel,
+                        id,
+                        request,
+                        force,
+                        provider,
+                        demand,
+                        base,
+                        source,
+                    } => {
+                        let _ = portrait_tx.send(PortraitRequest {
+                            image: source.preview.clone(),
+                            native_source: Some(source),
+                            focus: None,
+                            cancel,
+                            id,
+                            request,
+                            force,
+                            provider,
+                            demand,
+                            base,
                         });
                     }
                     Job::OpenSession { photos } => {
@@ -874,10 +1169,16 @@ pub fn start(ctx: eframe::egui::Context) -> (Sender<Job>, Receiver<Message>) {
 
 fn priority(job: &Job) -> u8 {
     match job {
-        Job::ReleaseMemory | Job::LoadAsset { .. } | Job::ImportFolder(_) => 0,
+        Job::ReleaseMemory
+        | Job::DiagnosticsPreviewPolicy(_)
+        | Job::LoadAsset { .. }
+        | Job::FramePreview { .. }
+        | Job::ImportFolder(_) => 0,
         #[cfg(test)]
         Job::BackgroundBarrier { .. } => 0,
         Job::Portrait { .. }
+        | Job::PortraitSource { .. }
+        | Job::ScoreFace { .. }
         | Job::Export { .. }
         | Job::SaveSession { .. }
         | Job::ReadSession(_)
@@ -894,7 +1195,7 @@ fn priority(job: &Job) -> u8 {
         }
         | Job::HoverRegion { .. } => 3,
         Job::Presets { .. } | Job::LayerThumbnails { .. } => 4,
-        Job::Import(_) | Job::OpenSession { .. } | Job::Demo => 0,
+        Job::Import(_) | Job::OpenSession { .. } | Job::Demo | Job::TransformPhoto { .. } => 0,
     }
 }
 
@@ -1030,6 +1331,96 @@ fn export_prepared(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn fitted_manual_preview_updates_are_local_and_match_complete_pixels() {
+        use engine::{Stroke, Target};
+        let image = Arc::new(RgbaImage::from_fn(320, 240, |x, y| {
+            image::Rgba([
+                (40 + (x * 7 + y * 3) % 180) as u8,
+                (45 + (x * 3 + y * 5) % 170) as u8,
+                (55 + (x * 5 + y * 11) % 160) as u8,
+                255,
+            ])
+        }));
+        let cancel = AtomicBool::new(false);
+        for tool in [Target::Liquify, Target::Heal, Target::Clone, Target::Patch] {
+            let mut incremental = engine::Renderer::default();
+            let mut complete = engine::Renderer::default();
+            let mut edit = Edit::default();
+            edit.settings.exposure = 0.2;
+            for step in 0..3 {
+                let center = [0.4 + step as f32 * 0.015, 0.5];
+                match tool {
+                    Target::Liquify => edit.warps.push(crate::geometry::WarpStroke {
+                        center,
+                        delta: [0.008, -0.004],
+                        radius: 0.047,
+                        softness: 0.7,
+                        strength: 85.0,
+                    }),
+                    Target::Heal => edit.strokes.push(Stroke {
+                        center,
+                        target: tool,
+                        radius: 0.036,
+                        softness: 0.7,
+                        erase: false,
+                        strength: 100.0,
+                    }),
+                    Target::Clone => edit.clones.push(crate::cleanup::CloneStamp {
+                        center,
+                        source: [center[0] + 0.1, center[1] - 0.08],
+                        radius: 0.04,
+                        softness: 0.7,
+                        strength: 90.0,
+                    }),
+                    Target::Patch => {
+                        if edit.patches.is_empty() {
+                            edit.patches.push(crate::cleanup::PatchStroke {
+                                feather: None,
+                                boundary: vec![
+                                    [0.4, 0.45],
+                                    [0.46, 0.45],
+                                    [0.46, 0.53],
+                                    [0.4, 0.53],
+                                ],
+                                offset: [0.1, -0.08],
+                                softness: 0.7,
+                                strength: 95.0,
+                            });
+                        } else {
+                            edit.patches[0].offset[0] += 0.01;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                let frame =
+                    render_preview(&mut incremental, &image, &edit, None, &cancel, true).unwrap();
+                assert_eq!(
+                    frame,
+                    render_preview(&mut complete, &image, &edit, None, &cancel, false).unwrap(),
+                    "{tool:?} step {step}"
+                );
+                if step > 0 {
+                    let damage = incremental.viewport_damage().unwrap();
+                    assert!(
+                        damage.width * damage.height < image.width() * image.height() / 4,
+                        "{tool:?} must redraw only its affected area"
+                    );
+                }
+            }
+            let cancelled = AtomicBool::new(true);
+            assert!(
+                render_preview(&mut incremental, &image, &edit, None, &cancelled, true).is_err()
+            );
+            // Undo/removal cannot retain pixels from the previous manual frame.
+            let reset = Edit::default();
+            assert_eq!(
+                render_preview(&mut incremental, &image, &reset, None, &cancel, true).unwrap(),
+                *image
+            );
+        }
+    }
 
     #[test]
     fn queued_projects_keep_independent_ids_formats_and_continue_after_cancellation() {
@@ -1256,6 +1647,52 @@ mod tests {
         }
         assert_ne!(results[0], results[4]);
         assert_eq!(results[0].dimensions(), (120, 150));
+    }
+
+    #[test]
+    fn staged_face_review_opens_original_dimensions_reuses_geometry_and_keeps_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("focus.png");
+        let image = RgbaImage::from_fn(1800, 1500, |x, y| {
+            image::Rgba([((x / 8 + y / 8) % 2 * 150 + 40) as u8, 100, 90, 255])
+        });
+        image.save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let mut source = engine::load_photo(&path).unwrap();
+        source.resident = false;
+        let seg = Arc::new(Segmentation {
+            prepared: PortraitDemand::GEOMETRY,
+            faces: vec![crate::geometry::FaceMesh {
+                landmarks: vec![],
+                bounds: [0.2, 0.2, 0.5, 0.5],
+                confidence: 1.,
+            }],
+            ..Default::default()
+        });
+        let (tx, rx) = start(eframe::egui::Context::default());
+        tx.send(Job::ScoreFace {
+            id: 71,
+            request: 3,
+            source,
+            base: Some(seg),
+            provider: Provider::Cpu,
+            cancel: Arc::new(AtomicBool::new(false)),
+        })
+        .unwrap();
+        match rx.recv_timeout(Duration::from_secs(15)).unwrap() {
+            Message::FaceFocus {
+                id: 71,
+                request: 3,
+                result,
+            } => {
+                let r = result.unwrap();
+                assert_eq!(r.dimensions, [1800, 1500]);
+                assert!(r.score.unwrap() > 0.);
+                assert_eq!(r.faces[0].native_size, [900, 750]);
+            }
+            _ => panic!("Unexpected face-review result"),
+        }
+        assert_eq!(bytes, std::fs::read(path).unwrap());
     }
 
     #[test]

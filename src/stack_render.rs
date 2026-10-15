@@ -15,6 +15,7 @@ struct Prefix {
     source: Weak<RgbaImage>,
     seg: Option<Weak<Segmentation>>,
     layers: Vec<Layer>,
+    sampling_context: Vec<Layer>,
     image: Arc<RgbaImage>,
 }
 #[derive(Default)]
@@ -29,6 +30,7 @@ fn same_layers(a: &[Layer], b: &[Layer]) -> bool {
                 && a.opacity == b.opacity
                 && a.blend == b.blend
                 && a.mask == b.mask
+                && a.sample_visible == b.sample_visible
                 && a.edit == b.edit
         })
 }
@@ -55,6 +57,7 @@ impl StackRenderer {
         &mut self,
         source: &Arc<RgbaImage>,
         layers: &[Layer],
+        context: &[Layer],
         seg: Option<&Arc<Segmentation>>,
         cancel: Option<&AtomicBool>,
     ) -> Result<Arc<RgbaImage>> {
@@ -62,6 +65,11 @@ impl StackRenderer {
         if layers.is_empty() {
             return Ok(source.clone());
         }
+        let sampling_context = if layers.iter().any(|layer| layer.sample_visible) {
+            context
+        } else {
+            &[]
+        };
         let hit = self
             .prefixes
             .iter()
@@ -71,6 +79,7 @@ impl StackRenderer {
                     && same_seg(&p.seg, seg)
                     && p.layers.len() <= layers.len()
                     && same_layers(&p.layers, &layers[..p.layers.len()])
+                    && same_layers(&p.sampling_context, sampling_context)
             })
             .max_by_key(|(_, p)| p.layers.len())
             .map(|(i, _)| i);
@@ -84,11 +93,13 @@ impl StackRenderer {
         };
         for (index, layer) in layers.iter().enumerate().skip(start) {
             cancelled(cancel)?;
-            let rendered = if layer.kind == LayerType::OriginalCopy {
-                self.flat().render(source, &layer.edit, seg, cancel)?
+            let input = if layer.kind == LayerType::OriginalCopy {
+                source
             } else {
-                self.flat().render(&image, &layer.edit, seg, cancel)?
+                &image
             };
+            let (input, edit) = self.sampled_input(source, input, layer, context, seg, cancel)?;
+            let rendered = self.flat().render(&input, &edit, seg, cancel)?;
             let coverage = layer.mask.as_ref().map(|mask| {
                 mask.coverage(
                     source.dimensions(),
@@ -112,6 +123,7 @@ impl StackRenderer {
                 source: Arc::downgrade(source),
                 seg: seg.map(Arc::downgrade),
                 layers: layers[..=index].to_vec(),
+                sampling_context: sampling_context.to_vec(),
                 image: image.clone(),
             });
             while self.prefixes.len() > 2
@@ -127,6 +139,45 @@ impl StackRenderer {
         }
         Ok(image)
     }
+    fn sampled_input(
+        &mut self,
+        source: &Arc<RgbaImage>,
+        input: &Arc<RgbaImage>,
+        layer: &Layer,
+        context: &[Layer],
+        seg: Option<&Arc<Segmentation>>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(Arc<RgbaImage>, Edit)> {
+        let mut edit = (*layer.edit).clone();
+        if layer.sample_visible
+            && (!edit.clones.is_empty()
+                || edit
+                    .strokes
+                    .iter()
+                    .any(|s| s.target == engine::Target::Heal))
+        {
+            // Donor evaluation excludes this layer and uses below-layer sampling for
+            // the remaining stack, making cross-layer sampling deterministic.
+            let donor_layers: Vec<_> = context
+                .iter()
+                .filter(|l| l.id != layer.id)
+                .map(|l| {
+                    let mut donor = l.clone();
+                    donor.sample_visible = false;
+                    donor
+                })
+                .collect();
+            let donor = self.prefix(source, &donor_layers, &donor_layers, seg, cancel)?;
+            if let Some(cleaned) =
+                crate::cleanup::apply_visible_donor(input, &donor, &edit, cancel)?
+            {
+                edit.strokes.retain(|s| s.target != engine::Target::Heal);
+                edit.clones.clear();
+                return Ok((Arc::new(cleaned), edit));
+            }
+        }
+        Ok((input.clone(), edit))
+    }
     pub(crate) fn render(
         &mut self,
         source: &Arc<RgbaImage>,
@@ -135,7 +186,7 @@ impl StackRenderer {
         cancel: Option<&AtomicBool>,
     ) -> Result<RgbaImage> {
         let layers = edit.resolved_layers();
-        Ok((*self.prefix(source, &layers, seg, cancel)?).clone())
+        Ok((*self.prefix(source, &layers, &layers, seg, cancel)?).clone())
     }
     pub(crate) fn region(
         &mut self,
@@ -151,15 +202,16 @@ impl StackRenderer {
                 .flat()
                 .render_region(source, &Edit::default(), seg, crop, cancel);
         };
-        let prefix = self.prefix(source, below, seg, cancel)?;
+        let prefix = self.prefix(source, below, &layers, seg, cancel)?;
         let input = if top.kind == LayerType::OriginalCopy {
             source
         } else {
             &prefix
         };
+        let (input, edit) = self.sampled_input(source, input, top, &layers, seg, cancel)?;
         let rendered = self
             .flat()
-            .render_region(input, &top.edit, seg, crop, cancel)?;
+            .render_region(&input, &edit, seg, crop, cancel)?;
         let base =
             image::imageops::crop_imm(&*prefix, crop.x, crop.y, crop.width, crop.height).to_image();
         let coverage = top

@@ -36,7 +36,7 @@ Native screenshot review found sharp 100% source pixels, preserved aspect ratio,
 cargo fmt --check
 cargo test --locked --lib -j 2 -- --nocapture
 $env:CARGO_PROFILE_RELEASE_LTO = 'false'
-cargo build --release --locked -j 2 --bin hastur-retouch --example runtime_validation --example high_resolution --example history_performance --example color_consistency --example smoke --example ai_smoke
+cargo build --release --locked -j 2 --bin hastur-retouch --example runtime_validation --example high_resolution --example history_performance --example ai_smoke
 cargo test --release --locked --lib -j 2 -- --nocapture
 .\scripts\validate-portraits.ps1 -SkipDownload -SkipBuild -Backends
 target/release/examples/history_performance.exe

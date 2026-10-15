@@ -86,6 +86,7 @@ pub struct Layer {
     pub blend: BlendMode,
     pub color: LayerColor,
     pub mask: Option<LayerMask>,
+    pub sample_visible: bool,
     pub edit: Box<Edit>,
 }
 impl Default for Layer {
@@ -100,6 +101,7 @@ impl Default for Layer {
             blend: BlendMode::Normal,
             color: LayerColor::None,
             mask: None,
+            sample_visible: false,
             edit: Box::default(),
         }
     }
@@ -134,6 +136,7 @@ impl Edit {
     pub fn flat_edit(&self) -> Self {
         let mut flat = self.clone();
         flat.stack = LayerStack::default();
+        flat.transform = Default::default();
         flat
     }
     pub fn ensure_stack(&mut self) {
@@ -194,7 +197,9 @@ impl Edit {
             .map_or_else(Edit::default, |layer| layer.edit.flat_edit());
         let mut stack = self.stack.clone();
         stack.active = id;
+        let transform = self.transform;
         *self = flat;
+        self.transform = transform;
         self.stack = stack;
         true
     }
@@ -263,7 +268,9 @@ impl Edit {
             let mut stack = self.stack.clone();
             stack.layers.clear();
             stack.active = 0;
+            let transform = self.transform;
             *self = flat;
+            self.transform = transform;
             self.stack = stack;
         } else {
             self.stack.layers.remove(index);
@@ -685,5 +692,144 @@ mod tests {
                 .unwrap(),
             native
         );
+    }
+    #[test]
+    fn visible_sampling_reads_upper_masked_layer_and_invalidates_native_and_preview_caches() {
+        let source = Arc::new(RgbaImage::from_pixel(
+            120,
+            140,
+            image::Rgba([60, 80, 110, 255]),
+        ));
+        let mut edit = Edit::default();
+        edit.ensure_stack();
+        edit.clones.push(crate::cleanup::CloneStamp {
+            center: [0.25, 0.5],
+            source: [0.75, 0.5],
+            radius: 0.06,
+            softness: 0.0,
+            strength: 100.0,
+        });
+        let upper = edit.add_layer(LayerType::Adjustment);
+        edit.settings.exposure = 1.0;
+        edit.active_layer_mut().unwrap().mask = Some(LayerMask {
+            base: 0,
+            strokes: vec![MaskStroke {
+                center: [0.75, 0.5],
+                radius: 0.14,
+                softness: 0.0,
+                strength: 100.0,
+                reveal: true,
+            }]
+            .into(),
+        });
+        edit.select_layer(1);
+        let mut renderer = Renderer::default();
+        let below = renderer.render(&source, &edit, None, None).unwrap();
+        assert_eq!(below.get_pixel(30, 70), source.get_pixel(30, 70));
+        edit.active_layer_mut().unwrap().sample_visible = true;
+        let visible = renderer.render(&source, &edit, None, None).unwrap();
+        assert!(visible.get_pixel(30, 70)[0] > below.get_pixel(30, 70)[0] + 15);
+        let crop = Crop {
+            x: 15,
+            y: 50,
+            width: 80,
+            height: 45,
+        };
+        assert_eq!(
+            renderer
+                .render_region(&source, &edit, None, crop, None)
+                .unwrap(),
+            image::imageops::crop_imm(&visible, crop.x, crop.y, crop.width, crop.height).to_image()
+        );
+        // Changes above the sampled layer must invalidate that layer's cached prefix.
+        edit.select_layer(upper);
+        edit.settings.exposure = 0.3;
+        edit.select_layer(1);
+        let updated = renderer.render(&source, &edit, None, None).unwrap();
+        assert!(updated.get_pixel(30, 70)[0] < visible.get_pixel(30, 70)[0]);
+        edit.stack
+            .layers
+            .iter_mut()
+            .find(|l| l.id == upper)
+            .unwrap()
+            .visible = false;
+        assert!(renderer.render(&source, &edit, None, None).unwrap() == *source);
+        let saved = ron::ser::to_string(&edit).unwrap();
+        assert_eq!(ron::from_str::<Edit>(&saved).unwrap(), edit);
+        assert_eq!(source.get_pixel(30, 70).0, [60, 80, 110, 255]);
+    }
+
+    #[test]
+    fn heal_can_sample_texture_on_another_visible_layer_without_changing_source_pixels() {
+        let mut image = RgbaImage::from_fn(200, 160, |x, y| {
+            let value = if x > 145 {
+                70 + ((x * 7 + y * 11) % 60) as u8
+            } else {
+                100
+            };
+            image::Rgba([value, value, value, 255])
+        });
+        image.put_pixel(100, 80, image::Rgba([25, 25, 25, 255]));
+        let source = Arc::new(image);
+        let mut edit = Edit::default();
+        edit.ensure_stack();
+        edit.strokes.push(engine::Stroke {
+            target: engine::Target::Heal,
+            center: [0.5, 0.5],
+            radius: 0.025,
+            erase: false,
+            strength: 100.0,
+            softness: 0.0,
+        });
+        let upper = edit.add_layer(LayerType::Retouch);
+        edit.clones.push(crate::cleanup::CloneStamp {
+            center: [0.5, 0.5],
+            source: [0.85, 0.5],
+            radius: 0.22,
+            softness: 0.0,
+            strength: 100.0,
+        });
+        edit.active_layer_mut().unwrap().mask = Some(LayerMask {
+            strokes: vec![MaskStroke {
+                center: [0.5, 0.5],
+                radius: 0.035,
+                softness: 0.0,
+                strength: 100.0,
+                reveal: false,
+            }]
+            .into(),
+            ..Default::default()
+        });
+        edit.select_layer(1);
+        let mut renderer = Renderer::default();
+        let below = renderer.render(&source, &edit, None, None).unwrap();
+        edit.active_layer_mut().unwrap().sample_visible = true;
+        let visible = renderer.render(&source, &edit, None, None).unwrap();
+        assert!(
+            (96..104).any(|x| (76..84).any(|y| below.get_pixel(x, y) != visible.get_pixel(x, y))),
+            "Heal should read the visible donor texture"
+        );
+        let crop = Crop {
+            x: 90,
+            y: 70,
+            width: 20,
+            height: 20,
+        };
+        assert!(
+            renderer
+                .render_region(&source, &edit, None, crop, None)
+                .unwrap()
+                == image::imageops::crop_imm(&visible, crop.x, crop.y, crop.width, crop.height)
+                    .to_image()
+        );
+        edit.stack
+            .layers
+            .iter_mut()
+            .find(|layer| layer.id == upper)
+            .unwrap()
+            .visible = false;
+        let hidden = renderer.render(&source, &edit, None, None).unwrap();
+        assert_eq!(hidden.get_pixel(100, 80).0, [100, 100, 100, 255]);
+        assert_eq!(source.get_pixel(100, 80).0, [25, 25, 25, 255]);
     }
 }

@@ -2,6 +2,740 @@
 use super::*;
 use egui::{Event, Modifiers, PointerButton};
 
+#[track_caller]
+fn finish_document_transform(h: &mut Harness) {
+    let job = h
+        .jobs
+        .try_iter()
+        .find(|j| matches!(j, Job::TransformPhoto { .. }))
+        .unwrap_or_else(|| {
+            panic!(
+                "missing transform job: edit {:?}, pixels {:?}, loading {}, history {:?}",
+                h.app.photos[h.app.current].edit.transform,
+                h.app.photos[h.app.current].photo.applied_transform,
+                h.app.document_loading.is_some(),
+                h.app.photos[h.app.current].history.depths()
+            )
+        });
+    let Job::TransformPhoto {
+        id,
+        request,
+        source,
+        transform,
+        cancel,
+    } = job
+    else {
+        unreachable!()
+    };
+    h.incoming
+        .send(Message::PhotoTransformed {
+            id,
+            request,
+            transform,
+            result: source.transformed(transform, Some(&cancel)),
+        })
+        .unwrap();
+    h.frame(vec![], Modifiers::NONE);
+    let p = &mut h.app.photos[h.app.current];
+    p.rendered_revision = p.revision;
+    h.app.preview_cancel = None;
+    h.app.render_busy = false;
+}
+
+#[test]
+fn crop_replaces_resize_in_toolbar_menu_context_and_keyboard_shortcuts() {
+    let mut h = Harness::new(1);
+    h.click("image-menu", Modifiers::NONE);
+    for key in [
+        "toolbar-transform",
+        "image-transform",
+        "image-resize",
+        "resize-width",
+        "resize-height",
+    ] {
+        assert!(
+            h.ctx
+                .data(|d| d.get_temp::<Rect>(egui::Id::new(("hit", key))))
+                .is_none(),
+            "Obsolete resizing control is still reachable: {key}"
+        );
+    }
+    h.click("image-crop", Modifiers::NONE);
+    for entry in 0..4 {
+        if entry == 1 {
+            h.click("toolbar-crop", Modifiers::NONE);
+        }
+        if entry == 2 {
+            h.key(egui::Key::T, Modifiers::CTRL);
+        }
+        if entry == 3 {
+            h.key(egui::Key::C, Modifiers::NONE);
+        }
+        let image = h.rect("image");
+        let corner = h.rect("transform-handle-4").center();
+        h.drag_path(&[corner, image.center()]);
+        let target = h.app.transform_draft.as_ref().unwrap().target;
+        assert_eq!(target.size, None, "Crop entry {entry} rescaled the image");
+        assert_eq!(target.base_dimensions((420, 640)), (420, 640));
+        assert_eq!(target.dimensions((420, 640)), (210, 320));
+        assert_eq!(h.rect("image"), image);
+        for key in ["frame-mode-resize", "transform-lock", "resize-apply"] {
+            assert!(
+                h.ctx
+                    .data(|d| d.get_temp::<Rect>(egui::Id::new(("hit", key))))
+                    .is_none()
+            );
+        }
+        h.key(egui::Key::Escape, Modifiers::NONE);
+        assert!(h.app.transform_draft.is_none());
+    }
+    assert_eq!(h.app.photos[0].history.depths(), (0, 0));
+}
+
+#[test]
+fn crop_controls_copy_pixels_restore_history_and_keep_tools_registered() {
+    let mut h = Harness::new(1);
+    let source = h.app.photos[0].photo.original.clone();
+    h.click("image-menu", Modifiers::NONE);
+    h.click("image-rotate-right", Modifiers::NONE);
+    assert_eq!(h.app.photos[0].edit.transform, Default::default());
+    let target = h.app.transform_draft.as_ref().unwrap().target;
+    assert_eq!(target.quarter_turns, 0);
+    assert_eq!(target.angle, 0.);
+    assert_eq!(target.crop.unwrap().angle, 90.);
+    h.key(egui::Key::Enter, Modifiers::NONE);
+    finish_document_transform(&mut h);
+    let cropped = h.app.photos[0].photo.original.clone();
+    assert_eq!(
+        h.app.photos[0].photo.dimensions(),
+        target.dimensions((420, 640))
+    );
+    let bounds = target.crop.unwrap().bounds((420, 640));
+    let (x, y) = (bounds.width / 2, bounds.height / 2);
+    assert_eq!(
+        cropped.get_pixel(x, y),
+        source.get_pixel((bounds.x + x as i64) as u32, (bounds.y + y as i64) as u32)
+    );
+    h.click("image-menu", Modifiers::NONE);
+    h.click("image-crop", Modifiers::NONE);
+    h.click("crop-reset", Modifiers::NONE);
+    let image = h.rect("image");
+    let corner = h.rect("transform-handle-4").center();
+    let anchor = h.rect("transform-handle-0").center();
+    h.drag_path(&[corner, anchor + (corner - anchor) * 0.75]);
+    assert_eq!(h.rect("image"), image);
+    assert_eq!(h.app.transform_draft.as_ref().unwrap().target.size, None);
+    h.key(egui::Key::Enter, Modifiers::NONE);
+    finish_document_transform(&mut h);
+    assert_eq!(
+        h.app.photos[0].photo.dimensions(),
+        h.app.photos[0].edit.transform.dimensions((420, 640))
+    );
+    h.app.undo(&h.ctx);
+    h.frame(vec![], Modifiers::NONE);
+    finish_document_transform(&mut h);
+    assert_eq!(h.app.photos[0].photo.original, cropped);
+    h.app.undo(&h.ctx);
+    h.frame(vec![], Modifiers::NONE);
+    finish_document_transform(&mut h);
+    assert_eq!(*h.app.photos[0].photo.original, *source);
+    h.app.redo(&h.ctx);
+    h.frame(vec![], Modifiers::NONE);
+    finish_document_transform(&mut h);
+    h.app.brush = Some(Target::Heal);
+    h.frame(vec![], Modifiers::NONE);
+    let photo_rect = h.rect("image");
+    let location = photo_rect.min + photo_rect.size() * vec2(0.35, 0.6);
+    h.click_at(location, Modifiers::NONE);
+    let p = &h.app.photos[0];
+    let stroke = p
+        .edit
+        .strokes
+        .last()
+        .expect("healing tool did not register");
+    assert!((stroke.center[0] - 0.35).abs() < 0.01);
+    assert!((stroke.center[1] - 0.6).abs() < 0.01);
+    assert_eq!(p.canonical_photo().dimensions(), (420, 640));
+}
+
+#[test]
+fn cancelled_transform_cannot_replace_pixels_after_undo_or_switching_photos() {
+    let mut h = Harness::new(2);
+    h.app.rotate_frame(1);
+    h.key(egui::Key::Enter, Modifiers::NONE);
+    h.frame(vec![], Modifiers::NONE);
+    let job = h
+        .jobs
+        .try_iter()
+        .find(|j| matches!(j, Job::TransformPhoto { .. }))
+        .unwrap();
+    let Job::TransformPhoto {
+        id,
+        request,
+        source,
+        transform,
+        cancel,
+    } = job
+    else {
+        unreachable!()
+    };
+    let result = source.transformed(transform, None);
+    h.app.undo(&h.ctx);
+    h.frame(vec![], Modifiers::NONE);
+    assert!(cancel.load(Ordering::Relaxed));
+    h.incoming
+        .send(Message::PhotoTransformed {
+            id,
+            request,
+            transform,
+            result,
+        })
+        .unwrap();
+    h.frame(vec![], Modifiers::NONE);
+    assert_eq!(h.app.photos[0].photo.dimensions(), (420, 640));
+    assert!(h.app.photos[0].document_ready());
+    h.app.rotate_frame(1);
+    h.key(egui::Key::Enter, Modifiers::NONE);
+    h.frame(vec![], Modifiers::NONE);
+    let job = h
+        .jobs
+        .try_iter()
+        .find(|j| matches!(j, Job::TransformPhoto { .. }))
+        .unwrap();
+    let Job::TransformPhoto {
+        id,
+        request,
+        source,
+        transform,
+        ..
+    } = job
+    else {
+        unreachable!()
+    };
+    h.app.current = 1;
+    h.frame(vec![], Modifiers::NONE);
+    h.incoming
+        .send(Message::PhotoTransformed {
+            id,
+            request,
+            transform,
+            result: source.transformed(transform, None),
+        })
+        .unwrap();
+    h.frame(vec![], Modifiers::NONE);
+    assert_eq!(h.app.photos[1].photo.dimensions(), (420, 640));
+}
+
+#[test]
+fn crop_handles_preview_live_then_commit_once_and_restore_through_undo() {
+    let mut h = Harness::new(1);
+    let source = h.app.photos[0].photo.original.clone();
+    h.click("toolbar-crop", Modifiers::NONE);
+    h.frame(vec![], Modifiers::NONE);
+    let corner = h.rect("transform-handle-4").center();
+    let anchor = h.rect("transform-handle-0").center();
+    let end = anchor + (corner - anchor) * 0.75;
+    h.frame(vec![Event::PointerMoved(corner)], Modifiers::NONE);
+    h.frame(
+        vec![primary(corner, true, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    h.frame(vec![Event::PointerMoved(end)], Modifiers::NONE);
+    let target = h.app.transform_draft.as_ref().unwrap().target;
+    assert_eq!(target.dimensions((420, 640)), (315, 480));
+    assert_eq!(target.base_dimensions((420, 640)), (420, 640));
+    assert_eq!(target.size, None);
+    assert!(h.rect("transform-handle-4").center().distance(end) < 1.);
+    assert_eq!(h.app.photos[0].history.depths(), (0, 0));
+    assert!(Arc::ptr_eq(&source, &h.app.photos[0].photo.original));
+    assert!(
+        !h.jobs
+            .try_iter()
+            .any(|j| matches!(j, Job::TransformPhoto { .. }))
+    );
+    h.frame(vec![primary(end, false, Modifiers::NONE)], Modifiers::NONE);
+    let center = h.rect("crop-frame").center();
+    let start = h.rect("transform-rotate").center();
+    let length = start.distance(center);
+    let end = center + vec2(length * 0.5, -length * 3_f32.sqrt() / 2.);
+    h.drag_path(&[start, end]);
+    let target = h.app.transform_draft.as_ref().unwrap().target;
+    assert!((target.crop.unwrap().angle - 30.).abs() < 0.01);
+    assert_eq!(target.angle, 0.);
+    assert_eq!(target.quarter_turns, 0);
+    assert!(h.app.photos[0].edit.strokes.is_empty());
+    h.key(egui::Key::Enter, Modifiers::NONE);
+    assert!(h.app.transform_draft.is_none());
+    finish_document_transform(&mut h);
+    assert_eq!(
+        h.app.photos[0].photo.dimensions(),
+        target.dimensions((420, 640))
+    );
+    assert_eq!(h.app.photos[0].history.depths(), (1, 0));
+    h.app.undo(&h.ctx);
+    h.frame(vec![], Modifiers::NONE);
+    finish_document_transform(&mut h);
+    assert_eq!(*h.app.photos[0].photo.original, *source);
+    h.app.redo(&h.ctx);
+    h.frame(vec![], Modifiers::NONE);
+    finish_document_transform(&mut h);
+    assert_eq!(h.app.photos[0].edit.transform, target);
+}
+
+#[test]
+fn crop_handles_move_aspect_frame_rotation_and_hidden_margin_restore_are_non_destructive() {
+    let mut h = Harness::new(1);
+    let source = h.app.photos[0].photo.original.clone();
+    h.key(egui::Key::C, Modifiers::NONE);
+    let image = h.rect("image");
+    let corner = h.rect("transform-handle-4").center();
+    h.frame(
+        vec![
+            Event::PointerMoved(corner),
+            primary(corner, true, Modifiers::NONE),
+        ],
+        Modifiers::NONE,
+    );
+    h.frame(vec![Event::PointerMoved(image.center())], Modifiers::NONE);
+    let frame = h.app.transform_draft.as_ref().unwrap().target.crop.unwrap();
+    assert!((frame.extent[0] - 0.5).abs() < 0.001 && (frame.extent[1] - 0.5).abs() < 0.001);
+    assert_eq!(
+        h.rect("image"),
+        image,
+        "Crop drag moved or resized the photograph"
+    );
+    assert!(Arc::ptr_eq(&source, &h.app.photos[0].photo.original));
+    assert_eq!(h.app.photos[0].history.depths(), (0, 0));
+    assert!(
+        !h.jobs
+            .try_iter()
+            .any(|j| matches!(j, Job::TransformPhoto { .. }))
+    );
+    h.frame(
+        vec![primary(image.center(), false, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    let center = h.rect("crop-frame").center();
+    h.drag_path(&[center, center + vec2(22., 17.)]);
+    assert_eq!(h.rect("image"), image);
+    assert!(
+        h.rect("crop-frame")
+            .center()
+            .distance(center + vec2(22., 17.))
+            < 1.
+    );
+    h.click("crop-aspect", Modifiers::NONE);
+    h.click("crop-aspect-1:1", Modifiers::NONE);
+    let f = h.app.transform_draft.as_ref().unwrap().target.crop.unwrap();
+    assert!((f.extent[0] * 420. - f.extent[1] * 640.).abs() < 0.01);
+    let center = h.rect("crop-frame").center();
+    let start = h.rect("transform-rotate").center();
+    let length = start.distance(center);
+    let (sin, cos) = 13_f32.to_radians().sin_cos();
+    let end = center + vec2(length * sin, -length * cos);
+    h.frame(
+        vec![
+            Event::PointerMoved(start),
+            primary(start, true, Modifiers::SHIFT),
+        ],
+        Modifiers::SHIFT,
+    );
+    h.frame(vec![Event::PointerMoved(end)], Modifiers::SHIFT);
+    let output = h.frame(
+        vec![primary(end, false, Modifiers::SHIFT)],
+        Modifiers::SHIFT,
+    );
+    let target = h.app.transform_draft.as_ref().unwrap().target;
+    assert!((target.crop.unwrap().angle - 15.).abs() < 0.01);
+    assert_eq!(target.angle, 0.);
+    assert_eq!(target.quarter_turns, 0);
+    assert_eq!(target.size, None);
+    assert_eq!(h.rect("image"), image);
+    // Frame vertices sample their position in the unchanged image, not rotated image UVs.
+    assert!(output.shapes.iter().any(|s| {
+        let egui::Shape::Mesh(mesh) = &s.shape else {
+            return false;
+        };
+        mesh.vertices.len() >= 3
+            && mesh.vertices.iter().all(|v| {
+                let uv = (v.pos - image.min) / image.size();
+                v.color == Color32::WHITE && v.uv.distance(pos2(uv.x, uv.y)) < 0.00001
+            })
+    }));
+    h.key(egui::Key::Enter, Modifiers::NONE);
+    finish_document_transform(&mut h);
+    assert_eq!(h.app.photos[0].history.depths(), (1, 0));
+    let crop_pixels = h.app.photos[0].photo.original.clone();
+    let bounds = target.crop.unwrap().bounds((420, 640));
+    let (x, y) = (bounds.width / 2, bounds.height / 2);
+    assert_eq!(
+        crop_pixels.get_pixel(x, y),
+        source.get_pixel((bounds.x + x as i64) as u32, (bounds.y + y as i64) as u32)
+    );
+    h.app.undo(&h.ctx);
+    h.frame(vec![], Modifiers::NONE);
+    finish_document_transform(&mut h);
+    assert_eq!(h.app.photos[0].photo.original, source);
+    h.app.redo(&h.ctx);
+    h.frame(vec![], Modifiers::NONE);
+    finish_document_transform(&mut h);
+    assert_eq!(h.app.photos[0].photo.original, crop_pixels);
+    h.click("toolbar-crop", Modifiers::NONE);
+    let Job::FramePreview {
+        id,
+        revision,
+        source: original,
+        edit,
+        seg,
+        cancel,
+    } = h
+        .jobs
+        .try_iter()
+        .find(|j| matches!(j, Job::FramePreview { .. }))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let result = crate::image_transform::frame_preview(&original, edit, seg.as_ref(), &cancel);
+    assert_eq!(result.as_ref().unwrap().dimensions(), source.dimensions());
+    h.incoming
+        .send(Message::FramePreview {
+            id,
+            revision,
+            result,
+        })
+        .unwrap();
+    h.frame(vec![], Modifiers::NONE);
+    assert!(!h.app.transform_draft.as_ref().unwrap().preview_pending);
+    h.click("crop-reset", Modifiers::NONE);
+    h.key(egui::Key::Enter, Modifiers::NONE);
+    finish_document_transform(&mut h);
+    assert_eq!(h.app.photos[0].photo.original, source);
+}
+
+#[test]
+fn transform_cancel_space_pan_and_switching_photos_never_create_edits() {
+    let mut h = Harness::new(2);
+    h.key(egui::Key::T, Modifiers::CTRL);
+    h.frame(vec![], Modifiers::NONE);
+    let p = h.rect("transform-handle-4").center();
+    h.drag_path(&[p, p - vec2(35., 40.)]);
+    assert!(
+        h.app
+            .transform_draft
+            .as_ref()
+            .unwrap()
+            .target
+            .crop
+            .is_some()
+    );
+    let target = h.app.transform_draft.as_ref().unwrap().target;
+    let before = h.rect("image").center();
+    h.frame(vec![key_event(egui::Key::Space, true)], Modifiers::NONE);
+    h.drag_path(&[before, before + vec2(20., 15.)]);
+    assert_eq!(h.app.transform_draft.as_ref().unwrap().target, target);
+    assert!(h.rect("image").center().distance(before + vec2(20., 15.)) < 1.);
+    h.frame(vec![key_event(egui::Key::Space, false)], Modifiers::NONE);
+    h.key(egui::Key::Escape, Modifiers::NONE);
+    assert!(h.app.transform_draft.is_none());
+    assert_eq!(h.app.photos[0].history.depths(), (0, 0));
+    assert_eq!(h.app.photos[0].edit.transform, Default::default());
+    h.click("toolbar-crop", Modifiers::NONE);
+    h.click("photo-1", Modifiers::NONE);
+    assert!(h.app.transform_draft.is_none());
+    assert!(h.app.photos.iter().all(|p| p.history.depths() == (0, 0)));
+}
+
+#[test]
+fn full_size_crop_moves_in_all_directions_without_resizing_or_worker_jobs() {
+    let mut h = Harness::new(1);
+    h.key(egui::Key::C, Modifiers::NONE);
+    let image = h.rect("image");
+    let source = h.app.photos[0].photo.original.clone();
+    for delta in [vec2(36., 27.), vec2(-72., -54.), vec2(36., 27.)] {
+        let start = h.rect("crop-move").center();
+        let before = h.app.transform_draft.as_ref().unwrap().target;
+        let frame = before.crop.unwrap_or_default();
+        h.frame(
+            vec![
+                Event::PointerMoved(start),
+                primary(start, true, Modifiers::NONE),
+            ],
+            Modifiers::NONE,
+        );
+        h.frame(vec![Event::PointerMoved(start + delta)], Modifiers::NONE);
+        let target = h.app.transform_draft.as_ref().unwrap().target;
+        let moved = target.crop.unwrap_or_default();
+        assert_eq!(moved.extent, frame.extent);
+        assert_eq!(moved.angle, frame.angle);
+        assert_eq!(target.dimensions((420, 640)), (420, 640));
+        assert_eq!(target.size, None);
+        assert_eq!(h.rect("image"), image);
+        assert!(h.rect("crop-move").center().distance(start + delta) <= 1.);
+        assert!(Arc::ptr_eq(&source, &h.app.photos[0].photo.original));
+        assert_eq!(h.app.photos[0].history.depths(), (0, 0));
+        assert!(
+            !h.jobs
+                .try_iter()
+                .any(|j| matches!(j, Job::TransformPhoto { .. } | Job::FramePreview { .. }))
+        );
+        h.frame(
+            vec![primary(start + delta, false, Modifiers::NONE)],
+            Modifiers::NONE,
+        );
+    }
+    let baseline = h
+        .app
+        .transform_draft
+        .as_ref()
+        .unwrap()
+        .target
+        .crop
+        .unwrap_or_default();
+    h.key(egui::Key::ArrowLeft, Modifiers::NONE);
+    h.key(egui::Key::ArrowUp, Modifiers::SHIFT);
+    let target = h.app.transform_draft.as_ref().unwrap().target;
+    let frame = target.crop.unwrap();
+    assert!((frame.center[0] - (baseline.center[0] - 1. / 420.)).abs() < 0.00001);
+    assert!((frame.center[1] - (baseline.center[1] - 10. / 640.)).abs() < 0.00001);
+    h.key(egui::Key::Enter, Modifiers::NONE);
+    finish_document_transform(&mut h);
+    assert_eq!(h.app.photos[0].history.depths(), (1, 0));
+    let working = h.app.photos[0].photo.original.clone();
+    assert_eq!(working.dimensions(), (420, 640));
+    assert_eq!(working.get_pixel(0, 0).0, [0; 4]);
+    let bounds = frame.bounds((420, 640));
+    assert!(bounds.x < 0 && bounds.y < 0);
+    assert_eq!(
+        working.get_pixel((-bounds.x) as u32, (-bounds.y) as u32),
+        source.get_pixel(0, 0)
+    );
+    h.app.undo(&h.ctx);
+    h.frame(vec![], Modifiers::NONE);
+    finish_document_transform(&mut h);
+    assert_eq!(h.app.photos[0].photo.original, source);
+    h.app.redo(&h.ctx);
+    h.frame(vec![], Modifiers::NONE);
+    finish_document_transform(&mut h);
+    assert_eq!(h.app.photos[0].photo.original, working);
+    let dir = tempfile::tempdir().unwrap();
+    session::save(
+        &dir.path().join("moved-frame.ron"),
+        &h.app.session_snapshot(false),
+    )
+    .unwrap();
+    let saved = session::read(&dir.path().join("moved-frame.ron")).unwrap();
+    assert_eq!(saved.photos[0].edit.transform, target);
+}
+
+#[test]
+fn rotated_and_tiny_crop_frames_move_with_axis_lock_and_pan_stays_separate() {
+    let mut h = Harness::new(1);
+    h.key(egui::Key::C, Modifiers::NONE);
+    let image = h.rect("image");
+    let corner = h.rect("transform-handle-4").center();
+    let anchor = h.rect("transform-handle-0").center();
+    h.drag_path(&[
+        corner,
+        anchor + vec2(image.width() / 420., image.height() / 640.),
+    ]);
+    let tiny = h.app.transform_draft.as_ref().unwrap().target;
+    assert_eq!(tiny.dimensions((420, 640)), (1, 1));
+    let start = h.rect("crop-move").center();
+    h.drag_path(&[start, start + vec2(80., 50.)]);
+    let moved = h.app.transform_draft.as_ref().unwrap().target;
+    assert_eq!(moved.crop.unwrap().extent, tiny.crop.unwrap().extent);
+    assert_eq!(moved.dimensions((420, 640)), (1, 1));
+    assert!(
+        h.rect("crop-move")
+            .center()
+            .distance(start + vec2(80., 50.))
+            < 1.
+    );
+    h.click("crop-reset", Modifiers::NONE);
+    h.app.rotate_frame(1);
+    h.frame(vec![], Modifiers::NONE);
+    let rotated = h.app.transform_draft.as_ref().unwrap().target;
+    assert_eq!(rotated.crop.unwrap().extent, [1.; 2]);
+    assert_eq!(rotated.dimensions((420, 640)), (640, 420));
+    for delta in [vec2(30., 12.), vec2(-9., -28.)] {
+        let start = h.rect("crop-move").center();
+        h.frame(
+            vec![
+                Event::PointerMoved(start),
+                primary(start, true, Modifiers::SHIFT),
+            ],
+            Modifiers::SHIFT,
+        );
+        h.frame(vec![Event::PointerMoved(start + delta)], Modifiers::SHIFT);
+        h.frame(
+            vec![primary(start + delta, false, Modifiers::SHIFT)],
+            Modifiers::SHIFT,
+        );
+        let position = h.rect("crop-move").center();
+        let expected = if delta.x.abs() > delta.y.abs() {
+            vec2(delta.x, 0.)
+        } else {
+            vec2(0., delta.y)
+        };
+        assert!(position.distance(start + expected) < 1.);
+        let target = h.app.transform_draft.as_ref().unwrap().target;
+        assert_eq!(target.dimensions((420, 640)), (640, 420));
+        assert_eq!(target.crop.unwrap().extent, [1.; 2]);
+        assert_eq!(target.crop.unwrap().angle, 90.);
+    }
+    let before = h.app.transform_draft.as_ref().unwrap().target;
+    let start = h.rect("crop-move").center();
+    h.frame(vec![key_event(egui::Key::Space, true)], Modifiers::NONE);
+    h.drag_path(&[start, start + vec2(20., -15.)]);
+    assert_eq!(h.app.transform_draft.as_ref().unwrap().target, before);
+    assert!(
+        h.rect("image")
+            .center()
+            .distance(image.center() + vec2(20., -15.))
+            < 1.
+    );
+    h.frame(vec![key_event(egui::Key::Space, false)], Modifiers::NONE);
+    h.key(egui::Key::Escape, Modifiers::NONE);
+    assert_eq!(h.app.photos[0].history.depths(), (0, 0));
+}
+
+#[test]
+fn crop_drag_uses_total_displacement_and_keeps_precision_after_leaving_image() {
+    let mut h = Harness::new(1);
+    h.key(egui::Key::C, Modifiers::NONE);
+    let image = h.rect("image");
+    let start = h.rect("crop-move").center();
+    h.frame(
+        vec![
+            Event::PointerMoved(start),
+            primary(start, true, Modifiers::NONE),
+        ],
+        Modifiers::NONE,
+    );
+    for dx in [80., 180., 90., 30., 0.] {
+        h.frame(
+            vec![Event::PointerMoved(start + vec2(dx, dx * 0.2))],
+            Modifiers::NONE,
+        );
+        assert_eq!(h.rect("image"), image);
+        assert_eq!(
+            h.app
+                .transform_draft
+                .as_ref()
+                .unwrap()
+                .target
+                .dimensions((420, 640)),
+            (420, 640)
+        );
+    }
+    h.frame(
+        vec![primary(start, false, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    assert_eq!(
+        h.app.transform_draft.as_ref().unwrap().target,
+        Default::default()
+    );
+    h.key(egui::Key::Enter, Modifiers::NONE);
+    assert_eq!(h.app.photos[0].history.depths(), (0, 0));
+}
+
+#[test]
+fn frame_movement_matches_native_pixels_at_different_zoom_and_display_scales() {
+    for (zoom, dpi) in [(0.62, 1.), (0.9, 1.25), (2., 2.)] {
+        let mut h = Harness::new(1);
+        h.ctx.set_pixels_per_point(dpi);
+        h.app.photos[0].view = View {
+            fit: false,
+            scale: zoom,
+            pan: [0.; 2],
+        };
+        h.frame(vec![], Modifiers::NONE);
+        h.key(egui::Key::C, Modifiers::NONE);
+        let image = h.rect("image");
+        let start = h.rect("crop-move").center();
+        let screen_delta = vec2(image.width() * 37. / 420., -image.height() * 23. / 640.);
+        h.drag_path(&[start, start + screen_delta]);
+        let target = h.app.transform_draft.as_ref().unwrap().target;
+        let bounds = target.crop.unwrap().bounds((420, 640));
+        assert_eq!((bounds.x, bounds.y), (37, -23));
+        assert_eq!(target.dimensions((420, 640)), (420, 640));
+        assert_eq!(h.rect("image"), image);
+        h.key(egui::Key::ArrowRight, Modifiers::SHIFT);
+        h.key(egui::Key::ArrowDown, Modifiers::NONE);
+        let target = h.app.transform_draft.as_ref().unwrap().target;
+        let bounds = target.crop.unwrap().bounds((420, 640));
+        assert_eq!((bounds.x, bounds.y), (47, -22));
+    }
+}
+
+#[test]
+fn preset_gallery_defers_thumbnail_work_during_live_strokes_and_keeps_previous_cards() {
+    let mut h = Harness::new(1);
+    let old = h.app.photos[0].edited_texture.clone();
+    h.app.preset_thumbs[0] = Some(old.clone());
+    h.app.brush = Some(Target::Heal);
+    h.frame(vec![], Modifiers::NONE);
+    h.jobs.try_iter().for_each(drop);
+    let start = h.rect("image").center();
+    h.frame(
+        vec![
+            Event::PointerMoved(start),
+            primary(start, true, Modifiers::NONE),
+        ],
+        Modifiers::NONE,
+    );
+    h.frame(
+        vec![Event::PointerMoved(start + vec2(18., 8.))],
+        Modifiers::NONE,
+    );
+    assert!(!h.jobs.try_iter().any(|j| matches!(j, Job::Presets { .. })));
+    assert_eq!(h.app.preset_thumbs[0].as_ref().unwrap().id(), old.id());
+    h.frame(
+        vec![primary(start + vec2(18., 8.), false, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    h.app.photos[0].rendered_revision = h.app.photos[0].revision;
+    h.app.last_edit = Instant::now() - Duration::from_millis(250);
+    h.app.render_busy = false;
+    h.app.preview_cancel = None;
+    h.frame(vec![], Modifiers::NONE);
+    assert!(h.jobs.try_iter().any(|j| matches!(j, Job::Presets { .. })));
+    assert_eq!(h.app.preset_thumbs[0].as_ref().unwrap().id(), old.id());
+}
+
+#[test]
+fn studio_presets_library_and_edit_use_the_same_photo_and_history() {
+    let mut h = Harness::new(2);
+    assert!(h.rect("presets-sidebar").right() < h.rect("canvas").left());
+    h.click("preset-1", Modifiers::NONE);
+    assert_eq!(
+        h.app.photos[0].edit.preset.as_deref(),
+        Some(h.app.presets[1].name.as_str())
+    );
+    assert_eq!(h.app.photos[0].history.depths(), (1, 0));
+    h.app.undo(&h.ctx);
+    h.frame(vec![], Modifiers::NONE);
+    assert!(h.app.photos[0].edit.preset.is_none());
+    h.click("workspace-library", Modifiers::NONE);
+    assert!(h.app.library_open);
+    h.click("library-photo-1", Modifiers::NONE);
+    assert_eq!(h.app.current, 1);
+    h.click("workspace-edit", Modifiers::NONE);
+    assert!(!h.app.library_open);
+    assert_eq!(h.app.current, 1);
+}
+
+fn key_event(key: egui::Key, pressed: bool) -> Event {
+    Event::Key {
+        key,
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    }
+}
 fn primary(pos: Pos2, pressed: bool, modifiers: Modifiers) -> Event {
     Event::PointerButton {
         pos,
@@ -9,6 +743,130 @@ fn primary(pos: Pos2, pressed: bool, modifiers: Modifiers) -> Event {
         pressed,
         modifiers,
     }
+}
+
+#[test]
+fn layer_mask_controls_paint_at_display_coordinates_and_undo_one_gesture() {
+    let mut h = Harness::new(1);
+    h.app.photos[0].edit.settings.exposure = 0.5;
+    h.app.photos[0].edit.sync_active_layer();
+    h.app.inspector = Some(Inspector::Layers);
+    h.frame(vec![], Modifiers::NONE);
+    h.click("layer-add-mask", Modifiers::NONE);
+    assert!(h.app.photos[0].edit.active_layer().unwrap().mask.is_some());
+    h.frame(vec![], Modifiers::NONE);
+    h.click("layer-paint-mask", Modifiers::NONE);
+    assert_eq!(h.app.brush, Some(Target::LayerMask));
+    h.app.show_mask = false;
+    h.app.photos[0].view.fit = false;
+    h.app.photos[0].view.scale = 0.9;
+    h.app.photos[0]
+        .edit
+        .warps
+        .push(crate::geometry::WarpStroke {
+            center: [0.5, 0.5],
+            delta: [0.04, 0.0],
+            radius: 0.25,
+            softness: 0.6,
+            strength: 100.0,
+        });
+    h.frame(vec![], Modifiers::NONE);
+    let before = h.app.photos[0].edit.clone();
+    let depth = h.app.photos[0].history.depths().0;
+    let rect = h.rect("image");
+    let start = rect.intersect(h.rect("canvas")).center();
+    let end = start + vec2(18.0, 12.0);
+    h.drag(start, end);
+    let mask = h.app.photos[0]
+        .edit
+        .active_layer()
+        .unwrap()
+        .mask
+        .as_ref()
+        .unwrap();
+    assert!(!mask.strokes.is_empty());
+    let uv = [
+        (start.x - rect.left()) / rect.width(),
+        (start.y - rect.top()) / rect.height(),
+    ];
+    assert!((mask.strokes[0].center[0] - uv[0]).abs() < 0.0001);
+    assert!((mask.strokes[0].center[1] - uv[1]).abs() < 0.0001);
+    assert!(mask.sample_uv(uv, (420, 640)) < 255);
+    assert_eq!(h.app.photos[0].history.depths().0, depth + 1);
+    let painted = h.app.photos[0].edit.clone();
+    h.app.undo(&h.ctx);
+    assert_eq!(h.app.photos[0].edit, before);
+    h.app.redo(&h.ctx);
+    assert_eq!(h.app.photos[0].edit, painted);
+    h.frame(vec![], Modifiers::NONE);
+    h.click("layer-invert-mask", Modifiers::NONE);
+    assert_eq!(
+        h.app.photos[0]
+            .edit
+            .active_layer()
+            .unwrap()
+            .mask
+            .as_ref()
+            .unwrap()
+            .base,
+        0
+    );
+    h.click("layer-remove-mask", Modifiers::NONE);
+    assert!(h.app.photos[0].edit.active_layer().unwrap().mask.is_none());
+    assert_eq!(h.app.brush, None);
+}
+
+#[test]
+fn visible_sampling_control_is_saved_per_layer_and_undoable() {
+    let mut h = Harness::new(1);
+    h.app.brush = Some(Target::Heal);
+    h.frame(vec![], Modifiers::NONE);
+    let before = h.app.photos[0].edit.clone();
+    h.click("sample-visible-layers", Modifiers::NONE);
+    assert!(h.app.photos[0].edit.active_layer().unwrap().sample_visible);
+    h.app.undo(&h.ctx);
+    assert_eq!(h.app.photos[0].edit, before);
+    h.app.redo(&h.ctx);
+    let saved = ron::ser::to_string(&h.app.photos[0].edit).unwrap();
+    assert!(
+        ron::from_str::<Edit>(&saved)
+            .unwrap()
+            .active_layer()
+            .unwrap()
+            .sample_visible
+    );
+}
+
+#[test]
+fn manual_target_checks_respect_partial_masks_and_offer_reveal_for_an_empty_black_mask() {
+    let mut h = Harness::new(1);
+    h.app.brush = Some(Target::Heal);
+    let upper = h.app.photos[0].edit.add_layer(LayerType::OriginalCopy);
+    h.app.photos[0].edit.active_layer_mut().unwrap().mask = Some(crate::layer_mask::LayerMask {
+        base: 0,
+        ..Default::default()
+    });
+    h.app.photos[0].edit.select_layer(1);
+    assert!(
+        !h.app.manual_blocked(),
+        "Masked upper image copy should allow lower edits"
+    );
+    h.app.photos[0].edit.select_layer(upper);
+    assert!(h.app.manual_blocked());
+    h.frame(vec![], Modifiers::NONE);
+    h.click("manual-target-fix", Modifiers::NONE);
+    assert_eq!(
+        h.app.photos[0]
+            .edit
+            .active_layer()
+            .unwrap()
+            .mask
+            .as_ref()
+            .unwrap()
+            .base,
+        255
+    );
+    assert!(!h.app.manual_blocked());
 }
 
 #[test]
@@ -915,7 +1773,8 @@ fn focus_and_filmstrip_shortcuts_expand_canvas_and_restore_previous_layout() {
     h.key(egui::Key::F, Modifiers::NONE);
     let focused = h.rect("canvas");
     assert!(focused.width() > canvas.width() + 250.);
-    assert!(focused.height() > canvas.height() + 100.);
+    // Zoom controls now share the filmstrip, giving the default canvas 40 px more height.
+    assert!(focused.height() > canvas.height() + 70.);
     assert!(h.app.inspector.is_none());
     assert!(!h.app.filmstrip_visible);
     h.key(egui::Key::F, Modifiers::NONE);
@@ -923,10 +1782,170 @@ fn focus_and_filmstrip_shortcuts_expand_canvas_and_restore_previous_layout() {
     assert!(h.app.inspector == Some(Inspector::Layers));
     h.key(egui::Key::F6, Modifiers::NONE);
     assert!(!h.app.filmstrip_visible);
-    assert!(h.rect("canvas").height() > canvas.height() + 100.);
+    assert!(h.rect("canvas").height() > canvas.height() + 70.);
     h.key(egui::Key::F6, Modifiers::NONE);
     assert_eq!(h.rect("canvas"), canvas);
     assert_eq!(h.app.photos[0].edit, edit);
+}
+
+#[test]
+fn plus_minus_resize_each_brush_without_editing_pixels_or_consuming_text_input() {
+    for target in [
+        Target::Skin,
+        Target::Teeth,
+        Target::Eyes,
+        Target::UnderEyes,
+        Target::Background,
+        Target::Heal,
+        Target::Liquify,
+        Target::Clone,
+        Target::Patch,
+        Target::LayerMask,
+        Target::Clothing,
+        Target::Dodge,
+        Target::Burn,
+        Target::StrayHair,
+    ] {
+        let mut h = Harness::new(1);
+        if target == Target::LayerMask {
+            h.app.photos[0].edit.add_layer(LayerType::Retouch);
+            h.app.photos[0].edit.active_layer_mut().unwrap().mask = Some(Default::default());
+        }
+        h.app.brush = Some(target);
+        h.frame(vec![], Modifiers::NONE);
+        let edit = h.app.photos[0].edit.clone();
+        let initial = h.app.brush_radius;
+        let scale = h.app.photos[0].view.scale;
+        h.key(egui::Key::Plus, Modifiers::NONE);
+        assert!((h.app.brush_radius - initial * 1.25).abs() < 0.00001);
+        h.key(egui::Key::Minus, Modifiers::NONE);
+        assert!((h.app.brush_radius - initial).abs() < 0.00001);
+        h.key(egui::Key::Equals, Modifiers::SHIFT);
+        assert!((h.app.brush_radius - initial * 1.25).abs() < 0.00001);
+        assert_eq!(h.app.photos[0].view.scale, scale);
+        assert_eq!(h.app.photos[0].edit, edit);
+        let radius = h.app.brush_radius;
+        h.key(egui::Key::Minus, Modifiers::CTRL);
+        assert_eq!(h.app.brush_radius, radius);
+        h.app.preferences_open = true;
+        h.key(egui::Key::Plus, Modifiers::NONE);
+        assert_eq!(h.app.brush_radius, radius);
+        h.app.preferences_open = false;
+        h.app.layer_rename = Some((
+            h.app.photos[0].id,
+            h.app.photos[0].edit.stack.active,
+            "Name".into(),
+        ));
+        h.key(egui::Key::Minus, Modifiers::NONE);
+        assert_eq!(h.app.brush_radius, radius);
+    }
+}
+
+#[test]
+fn face_review_is_selection_scoped_cancellable_and_rejects_old_results() {
+    let mut h = Harness::new(3);
+    h.app.photos[0].selected = true;
+    h.app.photos[1].selected = true;
+    h.app.photos[2].selected = false;
+    let edits: Vec<_> = h.app.photos.iter().map(|p| p.edit.clone()).collect();
+    h.app.start_focus_review();
+    let jobs: Vec<_> = h
+        .jobs
+        .try_iter()
+        .filter_map(|j| {
+            if let Job::ScoreFace {
+                id,
+                request,
+                cancel,
+                ..
+            } = j
+            {
+                Some((id, request, cancel))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(jobs.len(), 2);
+    let report = crate::focus::FocusReport {
+        dimensions: [420, 640],
+        faces: vec![crate::focus::FaceFocus {
+            bounds: [0.2, 0.2, 0.5, 0.5],
+            native_size: [210, 320],
+            score: Some(70.),
+            eyes: [Some(75.), Some(65.)],
+        }],
+        score: Some(70.),
+    };
+    h.app
+        .accept_face_focus(jobs[0].0, jobs[0].1, Ok(report.clone()));
+    assert!(h.app.face_focus.contains_key(&jobs[0].0));
+    assert!(h.app.focus_run.is_some());
+    h.app.tool = Tool::Batch;
+    h.frame(vec![], Modifiers::NONE);
+    h.click("focus-cancel", Modifiers::NONE);
+    assert!(jobs[1].2.load(Ordering::Relaxed));
+    h.app.start_focus_review();
+    h.app.accept_face_focus(jobs[1].0, jobs[1].1, Ok(report));
+    assert!(!h.app.face_focus.contains_key(&jobs[1].0));
+    assert_eq!(
+        h.app
+            .photos
+            .iter()
+            .map(|p| p.edit.clone())
+            .collect::<Vec<_>>(),
+        edits
+    );
+    assert!(h.app.photos.iter().all(|p| p.history.depths() == (0, 0)));
+}
+
+#[test]
+fn selective_batch_sync_keeps_local_work_and_prepares_unopened_selected_portraits() {
+    let mut h = Harness::new(3);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("staged.png");
+    h.app.photos[1].photo.original.save(&path).unwrap();
+    h.app.photos[1].photo.path = Some(path.clone());
+    h.app.photos[1].source_photo.path = Some(path);
+    h.app.photos[0].edit.settings.smoothing = 55.;
+    h.app.photos[0].edit.settings.exposure = 0.7;
+    h.app.photos[1].selected = true;
+    h.app.photos[2].selected = false;
+    h.app.photos[1].photo.resident = false;
+    h.app.photos[1].source_photo.resident = false;
+    h.app.photos[1].edit.settings.exposure = -0.5;
+    h.app.photos[1].edit.strokes.push(Stroke {
+        target: Target::Heal,
+        center: [0.4, 0.4],
+        radius: 0.02,
+        erase: false,
+        strength: 80.,
+        softness: 0.7,
+    });
+    let local = h.app.photos[1].edit.strokes.clone();
+    let other = h.app.photos[2].edit.clone();
+    h.app.sync_options = batch_workflow::SyncOptions {
+        portrait: true,
+        color: false,
+        background: false,
+        match_exposure: false,
+    };
+    h.app.sync();
+    assert_eq!(h.app.photos[1].edit.settings.smoothing, 55.);
+    assert_eq!(h.app.photos[1].edit.settings.exposure, -0.5);
+    assert_eq!(h.app.photos[1].edit.strokes, local);
+    assert_eq!(h.app.photos[2].edit, other);
+    let id = h.app.photos[1].id;
+    assert!(
+        h.jobs
+            .try_iter()
+            .any(|j| matches!(j,Job::PortraitSource {id:job_id,..} if job_id == id))
+    );
+    assert_eq!(h.app.photos[1].history.depths(), (1, 0));
+    let photo = &mut h.app.photos[1];
+    assert!(photo.history.undo(&mut photo.edit));
+    assert_eq!(h.app.photos[1].edit.settings.smoothing, 0.);
+    assert_eq!(h.app.photos[1].edit.strokes, local);
 }
 
 #[test]
@@ -956,6 +1975,126 @@ fn brush_shortcuts_set_actual_warp_parameters_and_do_not_steal_layer_rename_inpu
     h.key(egui::Key::Num5, Modifiers::NONE);
     assert_eq!(h.app.brush_radius, radius);
     assert_eq!(h.app.photos[0].rating, 0);
+}
+
+#[test]
+fn choosing_painted_repair_clears_inherited_erasing_and_records_brush_strength() {
+    for (target, key) in [
+        (Target::Clothing, "tool-Clothing wrinkles"),
+        (Target::StrayHair, "tool-Stray hair"),
+    ] {
+        let mut h = Harness::new(1);
+        h.app.tool = Tool::Portrait;
+        h.app.erase = true;
+        h.app.show_mask = true;
+        h.app.compare = true;
+        h.app.brush_strength = 43.;
+        h.frame(vec![], Modifiers::NONE);
+        h.click(key, Modifiers::NONE);
+        assert_eq!(h.app.brush, Some(target));
+        assert!(!h.app.erase && !h.app.show_mask && !h.app.compare);
+        let center = h.rect("image").center();
+        h.drag(center, center + vec2(25., 10.));
+        assert!(!h.app.photos[0].edit.strokes.is_empty());
+        assert!(
+            h.app.photos[0]
+                .edit
+                .strokes
+                .iter()
+                .all(|s| !s.erase && s.strength == 43.)
+        );
+        h.click("erase-painted-repair", Modifiers::NONE);
+        assert!(h.app.erase);
+    }
+}
+
+#[test]
+fn new_manual_tools_record_sized_strokes_pan_with_space_and_repair_disabled_adjustments() {
+    for target in [
+        Target::Clothing,
+        Target::StrayHair,
+        Target::Dodge,
+        Target::Burn,
+    ] {
+        let mut h = Harness::new(1);
+        h.app.brush = Some(target);
+        h.frame(vec![], Modifiers::NONE);
+        h.key(egui::Key::Plus, Modifiers::NONE);
+        let radius = h.app.brush_radius;
+        let center = h.rect("image").center();
+        h.drag(center, center + vec2(25., 10.));
+        assert!(
+            h.app.photos[0]
+                .edit
+                .strokes
+                .iter()
+                .any(|s| s.target == target && s.radius == radius && s.strength == 100.)
+        );
+        let strokes = h.app.photos[0].edit.strokes.clone();
+        h.frame(
+            vec![Event::Key {
+                key: egui::Key::Space,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            Modifiers::NONE,
+        );
+        h.drag(center, center + vec2(45., -25.));
+        h.frame(
+            vec![Event::Key {
+                key: egui::Key::Space,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            Modifiers::NONE,
+        );
+        assert_eq!(h.app.photos[0].edit.strokes, strokes);
+        if target == Target::Clothing || target == Target::Dodge {
+            let a = if target == Target::Clothing {
+                Adjustment::ClothingWrinkles
+            } else {
+                Adjustment::DodgeBurn
+            };
+            h.app.photos[0].edit.settings.disabled.push(a);
+            assert!(h.app.manual_blocked());
+            h.frame(vec![], Modifiers::NONE);
+            h.click("manual-target-fix", Modifiers::NONE);
+            assert!(!h.app.manual_blocked());
+        }
+    }
+}
+
+#[test]
+fn batch_auto_retouch_pause_resume_preserves_lighting_and_outside_selection() {
+    let mut h = Harness::new(3);
+    h.app.tool = Tool::Batch;
+    h.app.photos[0].selected = true;
+    h.app.photos[1].selected = true;
+    h.app.photos[2].selected = false;
+    h.app.photos[0].edit.settings.exposure = 0.6;
+    h.app.photos[1].edit.settings.contrast = -14.;
+    let outside = h.app.photos[2].edit.clone();
+    h.frame(vec![], Modifiers::NONE);
+    h.click("batch-auto-retouch", Modifiers::NONE);
+    assert_eq!(h.app.photos[0].edit.settings.exposure, 0.6);
+    assert_eq!(h.app.photos[1].edit.settings.contrast, -14.);
+    assert_eq!(h.app.photos[2].edit, outside);
+    let cancel = h.app.photos[1].ai_cancel.clone().unwrap();
+    let serial = h.app.photos[1].ai_request;
+    h.frame(vec![], Modifiers::NONE);
+    h.click("batch-ai-pause", Modifiers::NONE);
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(h.app.photos[1].ai_request > serial);
+    assert!(!h.app.photos[1].ai_processing);
+    h.frame(vec![], Modifiers::NONE);
+    h.click("batch-ai-resume", Modifiers::NONE);
+    assert!(h.app.photos[1].ai_processing);
+    assert!(h.app.photos[1].ai_failed.is_empty());
+    assert_eq!(h.app.photos[1].history.depths(), (1, 0));
 }
 
 #[test]
@@ -1668,8 +2807,8 @@ fn inspector_switches_preserve_tool_gestures_history_and_the_larger_canvas() {
     let viewport = h.rect("canvas");
     let screen = h.ctx.content_rect();
     assert!(
-        viewport.width() >= screen.width() - 395.0,
-        "Tighter chrome must leave more canvas width: {viewport:?}, screen {screen:?}"
+        viewport.width() >= screen.width() - 600.0,
+        "Presets and controls must leave most of the screen for the canvas: {viewport:?}, screen {screen:?}"
     );
     assert!(
         viewport.height() >= screen.height() - 322.0,
@@ -1890,7 +3029,7 @@ fn compact_view_menu_and_tab_open_close_panels_without_crowding_zoom_controls() 
     assert!(h.app.compact_open);
     h.key(egui::Key::Tab, Modifiers::NONE);
     assert!(h.app.inspector.is_none());
-    let content = h.rect("canvas-content");
+    let content = h.rect("filmstrip-content");
     for key in ["fit", "native", "zoom-plus", "zoom-minus"] {
         assert!(
             content.contains_rect(h.rect(key)),
@@ -2319,15 +3458,15 @@ fn automatic_recovery_skips_unusable_generations_before_starting_a_demo() {
 }
 
 #[test]
-fn minimum_window_keeps_zoom_controls_inside_canvas_content() {
+fn minimum_window_keeps_zoom_controls_visible_in_the_filmstrip() {
     let mut h = Harness::new(1);
     h.size = vec2(600.0 / 1.1, 560.0 / 1.1);
     h.frame(vec![], Modifiers::NONE);
-    let content = h.rect("canvas-content");
+    let content = h.rect("filmstrip-content");
     for control in ["fit", "native", "zoom-plus", "zoom-minus"] {
         assert!(
             content.contains_rect(h.rect(control)),
-            "{control} must remain fully visible above the filmstrip"
+            "{control} must remain fully visible in the filmstrip"
         );
     }
     h.click("native", Modifiers::NONE);
@@ -2555,6 +3694,363 @@ struct Harness {
     time: f64,
     size: Vec2,
 }
+
+#[test]
+fn image_pan_tracks_small_coalesced_and_release_movements_at_each_zoom_and_dpi() {
+    for dpi in [1., 1.25, 2.] {
+        for zoom in [None, Some(0.62), Some(1.), Some(4.)] {
+            for brush in [
+                None,
+                Some(Target::Liquify),
+                Some(Target::Heal),
+                Some(Target::Clone),
+                Some(Target::Patch),
+                Some(Target::Clothing),
+                Some(Target::StrayHair),
+                Some(Target::Dodge),
+                Some(Target::Burn),
+            ] {
+                let mut h = Harness::new(1);
+                h.ctx.set_pixels_per_point(dpi);
+                h.app.compare = false;
+                h.app.brush = brush;
+                h.app.photos[0].view = View {
+                    fit: zoom.is_none(),
+                    scale: zoom.unwrap_or(1.),
+                    pan: [17., -21.],
+                };
+                if brush.is_some() {
+                    h.frame(vec![key_event(egui::Key::Space, true)], Modifiers::NONE);
+                }
+                // Settle DPI-dependent font and panel sizing before capturing Fit.
+                for _ in 0..4 {
+                    h.frame(vec![], Modifiers::NONE);
+                }
+                let start = h.rect("image").intersect(h.rect("canvas")).center();
+                let original = h.app.photos[0].photo.original.clone();
+                let edit = h.app.photos[0].edit.clone();
+                let history = h.app.photos[0].history.depths();
+                let scale = h.app.photos[0].view.scale;
+                let base = h.app.photos[0].view.pan;
+                h.frame(
+                    vec![
+                        Event::PointerMoved(start),
+                        primary(start, true, Modifiers::NONE),
+                    ],
+                    Modifiers::NONE,
+                );
+                for delta in [
+                    vec2(0.25, -0.5),
+                    vec2(1., 1.),
+                    vec2(85., -41.),
+                    vec2(-1500., 900.),
+                    vec2(0., 0.),
+                ] {
+                    h.frame(vec![Event::PointerMoved(start + delta)], Modifiers::NONE);
+                    let pan = h.app.photos[0].view.pan;
+                    assert!(
+                        (pan[0] - base[0] - delta.x).abs() < 0.001
+                            && (pan[1] - base[1] - delta.y).abs() < 0.001,
+                        "dpi {dpi}, zoom {zoom:?}, {brush:?}, {pan:?} vs {delta:?}"
+                    );
+                    assert_eq!(
+                        h.app.photos[0].view.scale, scale,
+                        "dpi {dpi}, zoom {zoom:?}, {brush:?}, delta {delta:?}"
+                    );
+                }
+                let release = start + vec2(2., -3.);
+                h.frame(
+                    vec![
+                        Event::PointerMoved(release),
+                        primary(release, false, Modifiers::NONE),
+                    ],
+                    Modifiers::NONE,
+                );
+                assert_eq!(h.app.photos[0].view.pan, [base[0] + 2., base[1] - 3.]);
+                assert_eq!(h.app.canvas_gesture, Gesture::None);
+                assert_eq!(h.app.photos[0].edit, edit);
+                assert_eq!(h.app.photos[0].history.depths(), history);
+                assert!(Arc::ptr_eq(&h.app.photos[0].photo.original, &original));
+                // A complete second gesture may arrive within a single frame.
+                h.time += 1.;
+                let start = h.rect("canvas").center();
+                let end = start + vec2(3., 2.);
+                h.frame(
+                    vec![
+                        Event::PointerMoved(start),
+                        primary(start, true, Modifiers::NONE),
+                        Event::PointerMoved(end),
+                        primary(end, false, Modifiers::NONE),
+                    ],
+                    Modifiers::NONE,
+                );
+                assert_eq!(h.app.photos[0].view.pan, [base[0] + 5., base[1] - 1.]);
+                assert_eq!(h.app.photos[0].edit, edit);
+                assert_eq!(h.app.photos[0].history.depths(), history);
+            }
+        }
+    }
+}
+
+#[test]
+fn space_can_take_over_a_held_brush_before_the_drag_threshold_without_jumping() {
+    let mut h = Harness::new(1);
+    h.app.brush = Some(Target::Heal);
+    h.frame(vec![], Modifiers::NONE);
+    let start = h.rect("image").center();
+    h.frame(
+        vec![
+            Event::PointerMoved(start),
+            primary(start, true, Modifiers::NONE),
+        ],
+        Modifiers::NONE,
+    );
+    let painted = h.app.photos[0].edit.clone();
+    let base = h.app.photos[0].view.pan;
+    h.frame(
+        vec![
+            key_event(egui::Key::Space, true),
+            Event::PointerMoved(start + vec2(1., -1.)),
+        ],
+        Modifiers::NONE,
+    );
+    assert_eq!(h.app.photos[0].view.pan, [base[0] + 1., base[1] - 1.]);
+    h.frame(
+        vec![
+            key_event(egui::Key::Space, false),
+            Event::PointerMoved(start + vec2(9., -4.)),
+        ],
+        Modifiers::NONE,
+    );
+    assert_eq!(h.app.photos[0].view.pan, [base[0] + 9., base[1] - 4.]);
+    h.frame(
+        vec![primary(start + vec2(12., -8.), false, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    assert_eq!(h.app.photos[0].view.pan, [base[0] + 12., base[1] - 8.]);
+    assert_eq!(h.app.photos[0].edit, painted);
+}
+
+#[test]
+fn stationary_hand_click_preserves_fit_and_double_click_toggles_native_without_old_pan() {
+    let mut h = Harness::new(1);
+    h.app.brush = None;
+    h.app.compare = false;
+    for _ in 0..4 {
+        h.frame(vec![], Modifiers::NONE);
+    }
+    h.click_at(h.rect("canvas").center(), Modifiers::NONE);
+    assert!(h.app.photos[0].view.fit);
+    h.time += 1.;
+    h.app.photos[0].view = View {
+        fit: false,
+        scale: 2.,
+        pan: [31., -17.],
+    };
+    h.frame(vec![], Modifiers::NONE);
+    let point = h.rect("canvas").center();
+    h.click_at(point, Modifiers::NONE);
+    assert_eq!(h.app.photos[0].view.pan, [31., -17.]);
+    h.click_at(point, Modifiers::NONE);
+    assert!(h.app.photos[0].view.fit);
+    assert_eq!(h.app.photos[0].view.pan, [0.; 2]);
+    h.time += 1.;
+    h.click_at(point, Modifiers::NONE);
+    h.click_at(point, Modifiers::NONE);
+    assert!(!h.app.photos[0].view.fit);
+    assert_eq!(h.app.photos[0].view.scale, 1.);
+    assert_eq!(h.app.photos[0].history.depths(), (0, 0));
+}
+
+/// Run alone, outside compilation/inference, for comparable pan frame timings.
+#[test]
+#[ignore = "GPU timing diagnostic; run separately from the test suite"]
+fn profile_image_panning() {
+    let root = std::env::var_os("HASTUR_PAN_PROFILE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("output/panning/profile"));
+    std::fs::create_dir_all(&root).unwrap();
+    let source = image::open("assets/demo-portrait.png").unwrap().to_rgba8();
+    let mut csv = String::from(
+        "size,mode,zoom,frame,cpu_ms,gpu_ms,total_ms,tracking_error,tile_rebuilt,request_changed\n",
+    );
+    let mut report = String::new();
+    for multiplier in [1, 2, 3] {
+        let image = if multiplier == 1 {
+            source.clone()
+        } else {
+            image::imageops::resize(
+                &source,
+                source.width() * multiplier,
+                source.height() * multiplier,
+                image::imageops::FilterType::Lanczos3,
+            )
+        };
+        for edited in [false, true] {
+            let ctx = egui::Context::default();
+            theme(&ctx);
+            let (tx, jobs) = crossbeam_channel::unbounded();
+            let (incoming, rx) = crossbeam_channel::unbounded();
+            let mut app = HasturApp::from_channels(
+                tx,
+                rx,
+                true,
+                vec!["--hide-panels".into(), "--hide-filmstrip".into()],
+                None,
+            );
+            app.presets_visible = false;
+            app.tool = Tool::Color;
+            let mut h = Harness {
+                app,
+                ctx,
+                incoming,
+                jobs,
+                time: 0.,
+                size: vec2(1440., 940.),
+            };
+            let mut gpu = crate::gpu::diagnostics::FrameProfiler::new([1440, 940]).unwrap();
+            let mut frame = |h: &mut Harness, events: Vec<Event>| {
+                let start = Instant::now();
+                let output = h.frame(events, Modifiers::NONE);
+                let cpu = start.elapsed().as_secs_f64() * 1000.;
+                let gpu_ms = gpu.frame(&h.ctx, output).unwrap();
+                (cpu, gpu_ms, start.elapsed().as_secs_f64() * 1000.)
+            };
+            h.incoming
+                .send(Message::Imported(Ok(engine::photo_from_image(
+                    "pan-fixture.png".into(),
+                    None,
+                    image.clone(),
+                ))))
+                .unwrap();
+            h.incoming.send(Message::ImportFinished).unwrap();
+            frame(&mut h, vec![]);
+            let (tx, rx) = worker::start(h.ctx.clone());
+            h.app.tx = tx;
+            h.app.rx = rx;
+            h.app.render_busy = false;
+            h.app.preview_cancel = None;
+            if edited {
+                h.app.photos[0].edit.settings.exposure = 0.35;
+                h.app.photos[0].revision += 1;
+            }
+            let mode = if edited { "space-with-tool" } else { "hand" };
+            h.app.brush = edited.then_some(Target::Heal);
+            h.app.compare = false;
+            h.app.show_mask = false;
+            for (zoom, scale) in [("fit", None), ("62", Some(0.62)), ("100", Some(1.))] {
+                h.app.photos[0].view = View {
+                    fit: scale.is_none(),
+                    scale: scale.unwrap_or(1.),
+                    ..Default::default()
+                };
+                h.app.last_edit = Instant::now() - Duration::from_secs(1);
+                let deadline = Instant::now() + Duration::from_secs(20);
+                loop {
+                    frame(&mut h, vec![]);
+                    let p = &h.app.photos[0];
+                    let rect = h.rect("image");
+                    let crop = visible_source_crop(rect, h.rect("canvas"), p.photo.dimensions());
+                    if p.rendered_revision == p.revision
+                        && (!needs_detail_resolution(&p.photo, p.view.scale)
+                            || h.app
+                                .detail_region
+                                .as_ref()
+                                .is_some_and(|(id, rev, region, _)| {
+                                    *id == p.id
+                                        && *rev == p.revision
+                                        && crop_contains(*region, crop)
+                                }))
+                    {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "pan fixture did not settle");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                for _ in 0..5 {
+                    frame(&mut h, vec![]);
+                }
+                let edit = h.app.photos[0].edit.clone();
+                let pan = h.app.photos[0].view.pan;
+                let start = h.rect("canvas").center();
+                if edited {
+                    frame(
+                        &mut h,
+                        vec![Event::Key {
+                            key: egui::Key::Space,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: Modifiers::NONE,
+                        }],
+                    );
+                }
+                frame(
+                    &mut h,
+                    vec![
+                        Event::PointerMoved(start),
+                        primary(start, true, Modifiers::NONE),
+                    ],
+                );
+                let mut totals = vec![];
+                let mut rebuilds = 0;
+                let mut max_error = 0_f32;
+                for i in 1..=128 {
+                    let tick = Instant::now();
+                    let phase = i as f32 / 128.;
+                    let delta = vec2(
+                        (if i <= 64 { i } else { 128 - i }) as f32 * 4.,
+                        (phase * std::f32::consts::TAU).sin() * 64.,
+                    );
+                    let pos = start + delta;
+                    let serial = h.app.tile_serial;
+                    let request = h.app.detail_region_pending;
+                    let (cpu, gpu, total) = frame(&mut h, vec![Event::PointerMoved(pos)]);
+                    let actual = h.app.photos[0].view.pan;
+                    let error =
+                        vec2(actual[0] - pan[0] - delta.x, actual[1] - pan[1] - delta.y).length();
+                    max_error = max_error.max(error);
+                    let rebuilt = h.app.tile_serial != serial;
+                    rebuilds += usize::from(rebuilt);
+                    csv.push_str(&format!("{multiplier},{mode},{zoom},{i},{cpu:.4},{gpu:.4},{total:.4},{error:.4},{rebuilt},{}\n",h.app.detail_region_pending!=request));
+                    totals.push(total);
+                    std::thread::sleep(Duration::from_millis(16).saturating_sub(tick.elapsed()));
+                }
+                let release = start + vec2(2., 1.);
+                frame(
+                    &mut h,
+                    vec![
+                        Event::PointerMoved(release),
+                        primary(release, false, Modifiers::NONE),
+                    ],
+                );
+                if edited {
+                    frame(
+                        &mut h,
+                        vec![Event::Key {
+                            key: egui::Key::Space,
+                            physical_key: None,
+                            pressed: false,
+                            repeat: false,
+                            modifiers: Modifiers::NONE,
+                        }],
+                    );
+                }
+                assert_eq!(h.app.photos[0].edit, edit, "panning edited the image");
+                totals.sort_by(f64::total_cmp);
+                let line = format!(
+                    "{multiplier}x {mode}/{zoom}: median {:.2}, p95 {:.2}, p99 {:.2}, max {:.2} ms; {rebuilds} tile rebuilds; tracking error {max_error:.2}px\n",
+                    totals[64], totals[121], totals[126], totals[127]
+                );
+                print!("{line}");
+                report.push_str(&line);
+            }
+            report.push_str(&format!("Adapter: {}\n", gpu.adapter));
+        }
+    }
+    std::fs::write(root.join("timings.csv"), csv).unwrap();
+    std::fs::write(root.join("results.txt"), report).unwrap();
+}
 impl Harness {
     fn new(count: usize) -> Self {
         let ctx = egui::Context::default();
@@ -2588,9 +4084,11 @@ impl Harness {
         h.app.selection_anchor = 0;
         for (i, p) in h.app.photos.iter_mut().enumerate() {
             p.rendered_revision = p.revision;
+            p.processing = None;
             p.selected = i == 0;
         }
         h.app.render_busy = false;
+        h.app.preview_cancel = None;
         h.jobs.try_iter().for_each(drop);
         h.frame(vec![], Modifiers::NONE);
         h
@@ -2926,6 +4424,7 @@ fn patch_lasso_drag_commits_source_offset_and_is_one_undo_step() {
     h.drag(to_pos([0.25, 0.27]), to_pos([0.55, 0.27]));
     let edit = &mut h.app.photos[0].edit;
     assert_eq!(edit.patches.len(), 1);
+    assert_eq!(edit.patches[0].feather, Some(h.app.brush_radius));
     assert!((edit.patches[0].offset[0] - 0.3).abs() < 0.01);
     assert!(h.app.patch_draft.boundary.is_empty());
     let photo = &mut h.app.photos[0];
@@ -2992,6 +4491,240 @@ fn space_drag_pans_without_deselecting_or_painting_with_active_cleanup_tool() {
     ];
     assert!((h.app.photos[0].edit.strokes[0].center[0] - expected[0]).abs() < 0.001);
     assert!((h.app.photos[0].edit.strokes[0].center[1] - expected[1]).abs() < 0.001);
+}
+
+#[test]
+fn hand_and_space_pan_work_at_fit_and_small_zooms_and_do_not_snap_back() {
+    for brush in [
+        None,
+        Some(Target::Liquify),
+        Some(Target::Heal),
+        Some(Target::Clone),
+        Some(Target::Patch),
+    ] {
+        for scale in [None, Some(0.62), Some(0.9)] {
+            let mut h = Harness::new(1);
+            h.ctx.set_pixels_per_point(1.25);
+            h.app.brush = brush;
+            if let Some(scale) = scale {
+                h.app.photos[0].view = View {
+                    scale,
+                    fit: false,
+                    pan: [0.; 2],
+                };
+            }
+            h.frame(vec![], Modifiers::NONE);
+            // DPI changes reflow the viewport on the following frame.
+            h.frame(vec![], Modifiers::NONE);
+            let image = h.rect("image");
+            let edit = h.app.photos[0].edit.clone();
+            let pixels = h.app.photos[0].photo.original.clone();
+            if brush.is_some() {
+                h.frame(vec![key_event(egui::Key::Space, true)], Modifiers::NONE);
+            }
+            let start = h.rect("canvas").center();
+            h.drag_path(&[start, start + vec2(160., -110.)]);
+            h.frame(vec![], Modifiers::NONE);
+            let moved = h.rect("image");
+            assert!(
+                moved.center().distance(image.center() + vec2(160., -110.)) <= 1.,
+                "brush {brush:?}, scale {scale:?}: {image:?} -> {moved:?}; camera {:?}, gesture {:?}, canvas {:?}",
+                h.app.photos[0].view,
+                h.app.canvas_gesture,
+                h.rect("canvas")
+            );
+            assert!((moved.size() - image.size()).length() <= 0.001);
+            for _ in 0..4 {
+                h.frame(vec![], Modifiers::NONE);
+            }
+            assert_eq!(h.rect("image"), moved, "Camera snapped back after release");
+            if brush.is_some() {
+                h.frame(vec![key_event(egui::Key::Space, false)], Modifiers::NONE);
+            }
+            assert_eq!(h.app.brush, brush);
+            assert_eq!(h.app.photos[0].edit, edit);
+            assert_eq!(h.app.photos[0].history.depths(), (0, 0));
+            assert!(Arc::ptr_eq(&pixels, &h.app.photos[0].photo.original));
+            h.click("fit", Modifiers::NONE);
+            assert!(h.rect("image").center().distance(h.rect("canvas").center()) <= 1.);
+        }
+    }
+}
+
+#[test]
+fn empty_surrounding_canvas_accepts_pan_and_fit_without_rendering_offscreen_pixels() {
+    let mut h = Harness::new(1);
+    h.app.gpu = true;
+    h.app.filmstrip_visible = false;
+    h.app.photos[0].view = View {
+        scale: 2.,
+        fit: false,
+        pan: [10_000., -10_000.],
+    };
+    let source = h.app.photos[0].photo.original.clone();
+    let output = h.frame(vec![], Modifiers::NONE);
+    assert!(!h.rect("image").intersects(h.rect("canvas")));
+    assert!(
+        !output
+            .shapes
+            .iter()
+            .any(|s| matches!(s.shape, egui::Shape::Callback(_)))
+    );
+    assert!(h.app.detail_region_pending.is_none());
+    h.jobs.try_iter().for_each(drop);
+    let start = h.rect("canvas").center();
+    h.drag_path(&[start, start + vec2(-100., 80.)]);
+    assert_eq!(h.app.photos[0].view.pan, [9900., -9920.]);
+    assert!(
+        !h.jobs
+            .try_iter()
+            .any(|j| matches!(j, Job::DetailRegion { .. }))
+    );
+    h.click("fit", Modifiers::NONE);
+    h.frame(vec![], Modifiers::NONE);
+    assert!(h.rect("image").center().distance(h.rect("canvas").center()) <= 1.);
+    assert!(Arc::ptr_eq(&source, &h.app.photos[0].photo.original));
+    assert_eq!(h.app.photos[0].history.depths(), (0, 0));
+}
+
+#[test]
+fn crop_edges_scroll_continuously_and_fit_recovers_frame_without_changing_geometry() {
+    let mut h = Harness::new(1);
+    let normal = h.rect("canvas");
+    let inspector = h.app.inspector;
+    let presets = h.app.presets_visible;
+    let source = h.app.photos[0].photo.original.clone();
+    h.key(egui::Key::C, Modifiers::NONE);
+    let viewport = h.rect("canvas");
+    assert!(
+        viewport.width() > normal.width() + 400.,
+        "Crop did not reclaim unused panel space"
+    );
+    assert!(viewport.shrink(40.).contains_rect(h.rect("image")));
+    let start = h.rect("crop-move").center();
+    let edge = pos2(viewport.right() - 1., viewport.center().y);
+    h.frame(
+        vec![
+            Event::PointerMoved(start),
+            primary(start, true, Modifiers::NONE),
+        ],
+        Modifiers::NONE,
+    );
+    h.frame(vec![Event::PointerMoved(edge)], Modifiers::NONE);
+    let first = h.app.transform_draft.as_ref().unwrap().target;
+    let image = h.rect("image");
+    for _ in 0..8 {
+        h.frame(vec![], Modifiers::NONE);
+    }
+    let last = h.app.transform_draft.as_ref().unwrap().target;
+    assert!(last.crop.unwrap().center[0] > first.crop.unwrap().center[0]);
+    assert!(h.rect("image").left() < image.left() - 50.);
+    assert!(h.rect("crop-move").center().distance(edge) <= 1.);
+    assert_eq!(last.dimensions((420, 640)), (420, 640));
+    assert_eq!(last.size, None);
+    assert_eq!(h.app.photos[0].history.depths(), (0, 0));
+    assert!(Arc::ptr_eq(&source, &h.app.photos[0].photo.original));
+    assert!(
+        !h.jobs
+            .try_iter()
+            .any(|j| matches!(j, Job::TransformPhoto { .. } | Job::FramePreview { .. }))
+    );
+    h.frame(vec![primary(edge, false, Modifiers::NONE)], Modifiers::NONE);
+    h.frame(vec![], Modifiers::NONE);
+    assert_eq!(h.app.transform_draft.as_ref().unwrap().target, last);
+    h.key(egui::Key::Num0, Modifiers::NONE);
+    assert_eq!(h.app.transform_draft.as_ref().unwrap().target, last);
+    let room = h.rect("canvas").shrink(40.);
+    assert!(room.contains_rect(h.rect("image")));
+    assert!(room.contains_rect(h.rect("crop-frame")));
+    assert!(
+        h.rect("canvas")
+            .contains(h.rect("transform-rotate").center())
+    );
+    h.app.filmstrip_visible = false;
+    h.frame(vec![], Modifiers::NONE);
+    h.click("fit", Modifiers::NONE);
+    h.frame(vec![], Modifiers::NONE);
+    assert_eq!(h.app.transform_draft.as_ref().unwrap().target, last);
+    assert!(
+        h.rect("canvas")
+            .shrink(40.)
+            .contains_rect(h.rect("crop-frame"))
+    );
+    h.app.filmstrip_visible = true;
+    h.key(egui::Key::Escape, Modifiers::NONE);
+    assert!(h.app.inspector == inspector);
+    assert_eq!(h.app.presets_visible, presets);
+    assert_eq!(h.rect("canvas"), normal);
+}
+
+#[test]
+fn crop_can_extend_canvas_without_resizing_photo_and_shift_keeps_one_movement_axis() {
+    let mut h = Harness::new(1);
+    h.key(egui::Key::C, Modifiers::NONE);
+    let image = h.rect("image");
+    let start = h.rect("transform-handle-4").center();
+    h.drag_path(&[start, start + image.size() * 0.06]);
+    let target = h.app.transform_draft.as_ref().unwrap().target;
+    assert!(target.crop.unwrap().extent.iter().all(|v| *v > 1.));
+    assert_eq!(target.size, None);
+    assert_eq!(h.rect("image"), image);
+    let start = h.rect("crop-move").center();
+    let original_y = target.crop.unwrap().center[1];
+    h.frame(
+        vec![
+            Event::PointerMoved(start),
+            primary(start, true, Modifiers::SHIFT),
+        ],
+        Modifiers::SHIFT,
+    );
+    h.frame(
+        vec![Event::PointerMoved(start + vec2(30., 5.))],
+        Modifiers::SHIFT,
+    );
+    h.frame(
+        vec![Event::PointerMoved(start + vec2(32., 60.))],
+        Modifiers::SHIFT,
+    );
+    let target = h.app.transform_draft.as_ref().unwrap().target;
+    assert_eq!(
+        target.crop.unwrap().center[1],
+        original_y,
+        "Shift changed axes mid-gesture"
+    );
+    h.frame(
+        vec![primary(start + vec2(32., 60.), false, Modifiers::SHIFT)],
+        Modifiers::SHIFT,
+    );
+    let source = h.app.photos[0].photo.original.clone();
+    h.key(egui::Key::Enter, Modifiers::NONE);
+    finish_document_transform(&mut h);
+    let working = &h.app.photos[0].photo.original;
+    let bounds = target.crop.unwrap().bounds((420, 640));
+    assert!(working.width() > 420 && working.height() > 640);
+    assert_eq!(
+        working
+            .get_pixel(working.width() - 1, working.height() - 1)
+            .0,
+        [0; 4]
+    );
+    assert_eq!(
+        working.get_pixel(100, 100),
+        source.get_pixel((bounds.x + 100) as u32, (bounds.y + 100) as u32)
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let photo = &h.app.photos[0];
+    let exported = engine::export(
+        &photo.source_photo,
+        &photo.edit,
+        None,
+        directory.path(),
+        ExportSize::Original,
+        true,
+        100,
+    )
+    .unwrap();
+    assert_eq!(image::open(exported).unwrap().to_rgba8(), **working);
 }
 
 #[test]
@@ -3533,6 +5266,66 @@ fn native_button_requests_original_and_displays_exact_source_pixels() {
 }
 
 #[test]
+fn native_short_click_renders_the_sharp_canvas_before_the_overview() {
+    let mut h = Harness::new(1);
+    let p = &mut h.app.photos[0];
+    p.photo = engine::photo_from_image(
+        "native-click.png".into(),
+        None,
+        RgbaImage::from_pixel(1800, 2100, image::Rgba([90, 105, 120, 255])),
+    );
+    p.view.fit = false;
+    p.view.scale = 0.9;
+    p.rendered_revision = p.revision;
+    h.app.brush = Some(Target::Heal);
+    h.frame(vec![], Modifiers::NONE);
+    h.jobs.try_iter().for_each(drop);
+    let pos = h.rect("canvas").center();
+    h.frame(
+        vec![
+            Event::PointerMoved(pos),
+            primary(pos, true, Modifiers::NONE),
+            primary(pos, false, Modifiers::NONE),
+        ],
+        Modifiers::NONE,
+    );
+    let revision = h.app.photos[0].revision;
+    let jobs: Vec<_> = h.jobs.try_iter().collect();
+    let (id, crop) = jobs
+        .iter()
+        .find_map(|job| match job {
+            Job::DetailRegion {
+                id,
+                revision: rev,
+                crop,
+                ..
+            } if *rev == revision => Some((*id, *crop)),
+            _ => None,
+        })
+        .expect("A short click must request native feedback immediately");
+    assert!(
+        !jobs.iter().any(|job| matches!(
+            job,
+            Job::Render {
+                kind: RenderKind::Preview,
+                ..
+            }
+        )),
+        "Overview must wait for the native frame"
+    );
+    h.incoming
+        .send(Message::DetailRegionRendered {
+            id,
+            revision,
+            crop,
+            image: RgbaImage::from_pixel(crop.width, crop.height, image::Rgba([91, 105, 120, 255])),
+        })
+        .unwrap();
+    h.frame(vec![], Modifiers::NONE);
+    assert!(h.jobs.try_iter().any(|job| matches!(job, Job::Render { kind: RenderKind::Preview, revision: rev, .. } if rev == revision)));
+}
+
+#[test]
 fn native_detail_waits_for_the_latest_preview_before_starting_a_visible_region_render() {
     let mut h = Harness::new(1);
     let source = RgbaImage::from_fn(1600, 2000, |x, y| {
@@ -3738,6 +5531,7 @@ fn native_preset_hover_requests_a_region_and_keeps_edits_unchanged() {
     p.view.fit = false;
     p.view.scale = 1.0;
     h.app.tool = Tool::Presets;
+    h.app.preset_key = None;
     h.frame(vec![], Modifiers::NONE);
     h.frame(vec![], Modifiers::NONE);
     h.frame(vec![], Modifiers::NONE);
@@ -4007,13 +5801,29 @@ fn actual_manual_workers_update_fitted_and_native_canvases_before_pointer_releas
             std::thread::sleep(Duration::from_millis(4));
         }
     }
-    let tools = [Target::Liquify, Target::Heal, Target::Clone, Target::Patch];
+    let tools = [
+        Target::Liquify,
+        Target::Heal,
+        Target::Clone,
+        Target::Patch,
+        Target::Clothing,
+        Target::StrayHair,
+    ];
     for (native, tool) in [false, true]
         .into_iter()
         .flat_map(|native| tools.map(|tool| (native, tool)))
     {
         let mut h = Harness::new(0);
         let image = RgbaImage::from_fn(1600, 2100, |x, y| {
+            if tool == Target::StrayHair {
+                let shade = if x % 40 == 0 { 65 } else { 170 };
+                return image::Rgba([shade, shade, shade, 255]);
+            }
+            if tool == Target::Clothing {
+                let fold = (-0.5 * ((x as f32 % 200. - 100.) / 12.).powi(2)).exp();
+                let level = (170. - fold * 55. + ((x + y) % 2) as f32 * 4.) as u8;
+                return image::Rgba([level, level, level, 255]);
+            }
             image::Rgba([
                 (60 + (x * 5 + y * 3) % 140) as u8,
                 (80 + (x * 3 + y * 7) % 130) as u8,
@@ -4048,7 +5858,11 @@ fn actual_manual_workers_update_fitted_and_native_canvases_before_pointer_releas
             h.frame(vec![], Modifiers::NONE);
         }
         h.app.brush = Some(tool);
-        h.app.brush_radius = 0.04;
+        h.app.brush_radius = if tool == Target::StrayHair {
+            0.008
+        } else {
+            0.04
+        };
         h.app.brush_strength = 100.;
         let rect = h.rect("image");
         let start = h.rect("canvas").center();
@@ -4190,6 +6004,7 @@ fn shift_selection_and_view_survive_switching_photos() {
 fn preset_hover_is_temporary_and_thumbnail_jobs_use_real_settings() {
     let mut h = Harness::new(1);
     h.app.tool = Tool::Presets;
+    h.app.preset_key = None;
     h.frame(vec![], Modifiers::NONE);
     let before = h.app.photos[0].edit.clone();
     assert!(

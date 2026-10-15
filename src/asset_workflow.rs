@@ -108,7 +108,9 @@ impl HasturApp {
                     }
                     photo
                         .asset_cache_paths
-                        .extend(crate::ai_cache::release_source(&photo.photo.preview));
+                        .extend(crate::ai_cache::release_source(
+                            &photo.canonical_photo().preview,
+                        ));
                     // Preserve an edited filmstrip thumbnail before dropping native
                     // and working-size buffers. Reopening regenerates exact edits.
                     let (w, h) = crate::assets::thumbnail_dimensions(
@@ -133,8 +135,14 @@ impl HasturApp {
                         &photo.edited,
                         self.gpu,
                     );
+                    photo.source_seg = photo.canonical_seg().map(|s| Arc::new(s.session_copy()));
                     photo.photo.release_pixels();
+                    photo.source_photo.release_pixels();
                     photo.seg = photo.seg.as_ref().map(|s| Arc::new(s.session_copy()));
+                    photo.source_seg = photo
+                        .source_seg
+                        .as_ref()
+                        .map(|s| Arc::new(s.session_copy()));
                     photo.ai_request += 1;
                     photo.ai_processing = false;
                     photo.ai_provider = None;
@@ -189,6 +197,8 @@ impl HasturApp {
         match result {
             Ok(photo) => {
                 let p = &mut self.photos[self.current];
+                p.source_photo = photo.clone();
+                p.seg = p.source_seg.clone();
                 p.photo = photo;
                 p.original_texture =
                     photo_texture(ctx, &format!("original-{id}"), &p.photo.preview, self.gpu);
@@ -217,14 +227,11 @@ impl HasturApp {
             self.asset_loading = None;
         }
         let removed = self.photos.remove(index);
-        if let Some(cancel) = removed.ai_cancel {
+        if let Some(cancel) = &removed.ai_cancel {
             cancel.store(true, Ordering::Relaxed);
         }
-        for path in removed
-            .asset_cache_paths
-            .into_iter()
-            .chain(crate::ai_cache::release_source(&removed.photo.preview))
-        {
+        let source_cache = crate::ai_cache::release_source(&removed.canonical_photo().preview);
+        for path in removed.asset_cache_paths.into_iter().chain(source_cache) {
             let _ = std::fs::remove_file(path);
         }
         if let Some(path) = &removed.photo.path {

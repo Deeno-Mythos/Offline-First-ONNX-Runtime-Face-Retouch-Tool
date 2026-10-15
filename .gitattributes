@@ -1,0 +1,7 @@
+# Pinned license/notices files must keep their original bytes across Windows
+# checkouts. Preserve vendor license whitespace rather than editing legal text.
+/LICENSE -text
+/models/LICENSE -text
+/models/LICENSE-*.txt -text
+/models/ThirdPartyNotices.txt -text
+/release/licenses/*.txt -text -whitespace

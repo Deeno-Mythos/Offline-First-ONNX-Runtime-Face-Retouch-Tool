@@ -1,0 +1,43 @@
+Hastur Retouch 0.1.0-beta.1 - third-party components and modified models
+
+Application source: MIT; see LICENSE.
+Rust dependency notices and exact source URLs: licenses/Rust-THIRD-PARTY-NOTICES.txt
+Dependency inventory: licenses/rust-dependencies.json
+Unmodified MPL-2.0 dependency source archives: licenses/source-code/*.crate
+These archives are gzip-compressed tar files; their source remains under MPL-2.0.
+
+Face detector and face mesh:
+MediaPipe architecture/weights and Yakhyo's ONNX conversion, Apache-2.0.
+https://github.com/yakhyo/mediapipe-face-mesh-onnx
+Copyright 2026 Yakhyokhuja Valikhujaev; original notice: models/LICENSE-mediapipe.txt
+
+Skin retouch, local blemish detection and inpainting:
+Alibaba / ModelScope pretrained models, Apache-2.0.
+https://www.modelscope.cn/models/iic/cv_unet_skin_retouching_torch
+ONNX exporter: https://github.com/aoguai/skin-retouching-onnxruntime
+Copyright (c) Alibaba, Inc. and its affiliates.
+Original license: models/LICENSE-modelscope.txt
+MODIFICATION NOTICE: retouch_generator.onnx was locally fine-tuned on authorized
+paired studio portraits. Face, hair, eye, lip and broad color protection are applied
+in the runtime. This modification is by the Hastur Retouch project, not Alibaba.
+Burn model packs were converted from these same ONNX inputs for local inference.
+Model identity is recorded in installed-files.json; training data is not distributed.
+
+ONNX Runtime 1.24.4: Microsoft, MIT.
+models/LICENSE and models/ThirdPartyNotices.txt
+DirectML runtime and separately licensed redistributable:
+models/directml/LICENSE, ThirdPartyNotices.txt,
+DirectML-LICENSE.txt and DirectML-LICENSE-CODE.txt
+
+Microsoft Visual C++ runtime: unmodified x64 Microsoft.VC143.CRT redistributables.
+See licenses/Visual-Studio-Redist.txt and licenses/Visual-Studio-ThirdPartyNotices.txt.
+Application-local deployment must be maintained by rebuilding with updated runtimes.
+
+Installer created with Inno Setup 6.7.3 (Jordan Russell / Martijn Laan).
+https://jrsoftware.org/
+The installer runtime is unmodified; its copyright notices are retained.
+
+Startup portrait: AI-generated adult demo selected for Hastur Retouch.
+Logo: Hastur crown, refined from the project's supplied design.
+The project owner confirmed public distribution rights for these assets and the
+fine-tuned model on October 4, 2026. No private example photos are distributed.

@@ -62,10 +62,25 @@ pub fn analyze_cached(
     force: bool,
     stage: impl FnMut(Segmentation),
 ) -> Result<Segmentation> {
-    if !force && let Some(seg) = crate::ai_cache::load(image, provider) {
-        return Ok(seg);
+    let cached = if force {
+        None
+    } else {
+        crate::ai_cache::load(image, provider)
+    };
+    if let Some(seg) = cached
+        .as_ref()
+        .filter(|s| s.prepared.contains(PortraitDemand::ALL))
+    {
+        return Ok(seg.clone());
     }
-    let seg = analyze_portrait(image, provider, stage)?;
+    let seg = analyze_portrait_demand_with_status(
+        image,
+        provider,
+        PortraitDemand::ALL,
+        cached.as_ref(),
+        stage,
+        |_| {},
+    )?;
     // A cache write failure must never turn a successfully analyzed photo into an error.
     let _ = crate::ai_cache::save(image, &seg, provider);
     Ok(seg)
@@ -121,15 +136,30 @@ pub fn analyze_shared_demand_cached_with_status(
         None,
         0.05,
     ));
-    if !force && let Some(seg) = crate::ai_cache::load_shared(image, provider) {
+    let cached = if force {
+        None
+    } else {
+        crate::ai_cache::load_shared(image, provider)
+    };
+    if let Some(seg) = cached.as_ref().filter(|s| s.prepared.contains(demand)) {
         status(AiStatus::new(
             "Cached portrait ready",
             &seg.status,
             None,
             1.0,
         ));
-        return Ok(seg);
+        return Ok(seg.clone());
     }
+    // Prefer an existing richer photo-owned state, especially explicit masks.
+    // Otherwise a partial disk result seeds only the missing neural stages.
+    let base = base
+        .filter(|b| {
+            b.custom_skin
+                || cached
+                    .as_ref()
+                    .is_none_or(|c| !c.prepared.contains(b.prepared))
+        })
+        .or(cached.as_ref());
     let seg = analyze_portrait_demand_with_status(
         image,
         provider,
@@ -138,7 +168,8 @@ pub fn analyze_shared_demand_cached_with_status(
         stage,
         &mut status,
     )?;
-    if seg.prepared.contains(PortraitDemand::ALL)
+    if seg.prepared.geometry
+        && !seg.custom_skin
         && crate::ai_cache::save(image, &seg, provider).is_ok()
     {
         crate::ai_cache::associate(image, &seg, provider);
@@ -203,18 +234,40 @@ pub fn analyze_portrait_with_status(
 }
 
 pub fn model_path(name: &str) -> std::path::PathBuf {
-    let dirs = [
-        std::path::PathBuf::from("models"),
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.join("models")))
-            .unwrap_or_default(),
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models"),
-    ];
+    if let Some(root) = std::env::var_os("HASTUR_MODELS_DIR") {
+        return std::path::PathBuf::from(root).join(name);
+    }
+    let dirs = model_directories(
+        std::env::current_exe().ok().as_deref(),
+        std::env::current_dir().ok().as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    );
     dirs.iter()
         .map(|p| p.join(name))
         .find(|p| p.is_file())
         .unwrap_or_else(|| dirs[0].join(name))
+}
+
+fn model_directories(
+    executable: Option<&Path>,
+    cwd: Option<&Path>,
+    source: &Path,
+) -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![
+        executable
+            .and_then(Path::parent)
+            .unwrap_or_else(|| Path::new("."))
+            .join("models"),
+    ];
+    // Cargo examples and local builds may use the source models. Installed builds
+    // must never silently depend on the developer's checkout or working directory.
+    if executable.is_some_and(|exe| exe.starts_with(source.join("target"))) {
+        if let Some(cwd) = cwd {
+            dirs.push(cwd.join("models"));
+        }
+        dirs.push(source.join("models"));
+    }
+    dirs
 }
 
 #[cfg(feature = "onnx")]
@@ -248,7 +301,7 @@ pub(crate) fn session_with_profile(
         });
     if !runtime.is_file() {
         bail!(
-            "ONNX Runtime is missing: {}. Run scripts/setup-ai.ps1 or set ORT_DYLIB_PATH.",
+            "The bundled AI runtime is missing: {}. Reinstall Hastur Retouch to restore its models and runtime.",
             runtime.display()
         );
     }
@@ -402,4 +455,23 @@ pub fn infer(
         seg.background = data[..n].iter().map(|&v| 1.0 - v.clamp(0.0, 1.0)).collect();
     }
     Ok(seg)
+}
+#[cfg(test)]
+mod installation_tests {
+    use super::*;
+
+    #[test]
+    fn installed_models_do_not_fall_back_to_developer_or_working_directory() {
+        let source = Path::new("source");
+        let dirs = model_directories(Some(Path::new("installed/app.exe")), Some(source), source);
+        assert_eq!(dirs, vec![std::path::PathBuf::from("installed/models")]);
+        let dirs = model_directories(
+            Some(Path::new("source/target/release/examples/check.exe")),
+            Some(source),
+            source,
+        );
+        assert_eq!(dirs.len(), 3);
+        assert_eq!(dirs[0], Path::new("source/target/release/examples/models"));
+        assert_eq!(dirs[2], Path::new("source/models"));
+    }
 }

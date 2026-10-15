@@ -101,6 +101,7 @@ pub fn stage(path: &Path) -> Result<Photo> {
     };
     let thumbnail = Arc::new(thumbnail);
     Ok(Photo {
+        applied_transform: Default::default(),
         name: path
             .file_name()
             .unwrap_or_default()

@@ -42,32 +42,42 @@ impl LayerKind {
     pub fn has_content(self, edit: &Edit) -> bool {
         let settings = edit.settings.effective();
         match self {
-            Self::Portrait => [
-                settings.smoothing,
-                settings.blemishes,
-                settings.tone_evenness,
-                settings.redness,
-                settings.teeth,
-                settings.eyes,
-                settings.under_eyes,
-                settings.forehead,
-                settings.laugh_lines,
-                settings.contour,
-                settings.face_highlight,
-                settings.eye_size,
-                settings.nose_width,
-                settings.lip_plumpness,
-                settings.jawline,
-                settings.flyaway_hairs,
-            ]
-            .iter()
-            .any(|v| *v != 0.0),
+            Self::Portrait => {
+                [
+                    settings.smoothing,
+                    settings.blemishes,
+                    settings.tone_evenness,
+                    settings.redness,
+                    settings.teeth,
+                    settings.eyes,
+                    settings.under_eyes,
+                    settings.forehead,
+                    settings.laugh_lines,
+                    settings.contour,
+                    settings.face_highlight,
+                    settings.eye_size,
+                    settings.nose_width,
+                    settings.lip_plumpness,
+                    settings.jawline,
+                    settings.flyaway_hairs,
+                ]
+                .iter()
+                .any(|v| *v != 0.0)
+                    || settings.skin_tone.active()
+                    || (settings.clothing_wrinkles != 0.
+                        && edit
+                            .strokes
+                            .iter()
+                            .any(|s| s.target == Target::Clothing && !s.erase && s.strength != 0.))
+            }
             Self::Color => {
                 [
                     settings.exposure,
                     settings.contrast,
                     settings.shadows,
                     settings.highlights,
+                    settings.whites,
+                    settings.blacks,
                     settings.warmth,
                     settings.tint,
                     settings.saturation,
@@ -77,6 +87,12 @@ impl LayerKind {
                 .iter()
                 .any(|v| *v != 0.0)
                     || settings.color.active()
+                    || (settings.dodge_burn != 0.
+                        && edit.strokes.iter().any(|s| {
+                            matches!(s.target, Target::Dodge | Target::Burn)
+                                && !s.erase
+                                && s.strength != 0.
+                        }))
             }
             Self::Background => {
                 settings.background != Background::Original && settings.background_opacity != 0.0
@@ -84,10 +100,9 @@ impl LayerKind {
             Self::Liquify => edit.warps.iter().any(|stroke| stroke.strength != 0.0),
             Self::SpotHeal => {
                 settings.healing != 0.0
-                    && edit
-                        .strokes
-                        .iter()
-                        .any(|stroke| stroke.target == Target::Heal && !stroke.erase)
+                    && edit.strokes.iter().any(|stroke| {
+                        matches!(stroke.target, Target::Heal | Target::StrayHair) && !stroke.erase
+                    })
             }
             Self::CloneStamp => edit.clones.iter().any(|stroke| stroke.strength != 0.0),
             Self::Patch => edit.patches.iter().any(|stroke| stroke.strength != 0.0),
@@ -152,6 +167,7 @@ impl Edit {
             &mut settings.smoothing,
             &mut settings.blemishes,
             &mut settings.tone_evenness,
+            &mut settings.skin_tone.strength,
             &mut settings.redness,
             &mut settings.teeth,
             &mut settings.eyes,
@@ -165,6 +181,7 @@ impl Edit {
             &mut settings.lip_plumpness,
             &mut settings.jawline,
             &mut settings.flyaway_hairs,
+            &mut settings.clothing_wrinkles,
         ] {
             *value *= portrait;
         }
@@ -174,6 +191,9 @@ impl Edit {
             &mut settings.contrast,
             &mut settings.shadows,
             &mut settings.highlights,
+            &mut settings.whites,
+            &mut settings.blacks,
+            &mut settings.dodge_burn,
             &mut settings.warmth,
             &mut settings.tint,
             &mut settings.saturation,
@@ -213,7 +233,7 @@ impl Edit {
             result.strokes = self
                 .strokes
                 .iter()
-                .filter(|stroke| stroke.target != Target::Heal)
+                .filter(|stroke| !matches!(stroke.target, Target::Heal | Target::StrayHair))
                 .cloned()
                 .collect();
         }
@@ -310,6 +330,7 @@ mod tests {
         }]
         .into();
         edit.patches = vec![PatchStroke {
+            feather: None,
             boundary: vec![[0.2; 2], [0.3, 0.2], [0.3; 2]],
             offset: [0.1; 2],
             softness: 0.5,

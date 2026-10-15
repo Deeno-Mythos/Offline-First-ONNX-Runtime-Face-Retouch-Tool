@@ -220,6 +220,9 @@ impl<'a> Mapping<'a> {
         let mut global = vec![];
         let short = dims.0.min(dims.1) as f32;
         for (i, s) in edit.warps.iter().enumerate() {
+            if s.strength == 0. || s.delta == [0.; 2] {
+                continue;
+            }
             let rx = s.radius.max(0.0001) * short / dims.0 as f32 + 0.000001;
             let ry = s.radius.max(0.0001) * short / dims.1 as f32 + 0.000001;
             let (x0, x1) = (
@@ -243,12 +246,22 @@ impl<'a> Mapping<'a> {
                 }
             }
         }
+        let settings = edit.settings.effective();
+        let face_shape = [
+            settings.eye_size,
+            settings.nose_width,
+            settings.lip_plumpness,
+            settings.jawline,
+        ]
+        .iter()
+        .any(|v| *v != 0.);
         Self {
-            settings: edit.settings.effective(),
+            settings,
             dims,
             bins,
             global,
             faces: seg
+                .filter(|_| face_shape)
                 .into_iter()
                 .flat_map(|s| s.faces.iter())
                 .filter_map(|f| PreparedFace::new(f, dims))
@@ -285,10 +298,14 @@ impl<'a> Mapping<'a> {
                 (result[0] - stroke.center[0]) * self.dims.0 as f32 / short,
                 (result[1] - stroke.center[1]) * self.dims.1 as f32 / short,
             ];
-            let weight = brush_weight(
-                d[0].hypot(d[1]) / stroke.radius.max(0.0001),
-                stroke.softness,
-            ) * (stroke.strength / 100.0).clamp(0.0, 1.0);
+            // Spatial cells include the square bounding box around each brush.
+            // Reject its empty corners before computing a square root/falloff.
+            let radius = stroke.radius.max(0.0001);
+            if d[0].abs() >= radius || d[1].abs() >= radius {
+                continue;
+            }
+            let weight = brush_weight(d[0].hypot(d[1]) / radius, stroke.softness)
+                * (stroke.strength / 100.0).clamp(0.0, 1.0);
             for (c, v) in result.iter_mut().enumerate() {
                 *v -= stroke.delta[c] * weight;
             }
@@ -354,7 +371,9 @@ impl WarpCache {
         let edit = effective.as_ref();
         let s = edit.settings.effective();
         let shape = [s.eye_size, s.nose_width, s.lip_plumpness, s.jawline];
-        let faces = seg.map_or(&[][..], |s| s.faces.as_slice());
+        let faces = seg
+            .filter(|_| shape.iter().any(|v| *v != 0.))
+            .map_or(&[][..], |s| s.faces.as_slice());
         let grid_dims = field_dimensions(edit, image_dims);
         let same_base = self
             .key
@@ -561,6 +580,7 @@ pub(crate) fn field_dimensions(edit: &Edit, (w, h): (u32, u32)) -> (u32, u32) {
     let grid = edit
         .warps
         .iter()
+        .filter(|s| s.strength != 0. && s.delta != [0.; 2])
         .map(|s| (8.0 / s.radius.max(0.001)).ceil() as u32)
         .max()
         .unwrap_or(384)
@@ -830,5 +850,31 @@ mod tests {
                 assert_eq!(mapping.source(point), expected, "{point:?}");
             }
         }
+    }
+
+    #[test]
+    fn zero_strength_tiny_brushes_do_not_inflate_the_grid_or_change_existing_warps() {
+        let image = RgbaImage::from_fn(170, 200, |x, y| {
+            image::Rgba([(x + y) as u8, (x / 2 + y) as u8, 100, 255])
+        });
+        let mut edit = Edit::default();
+        edit.warps.push(WarpStroke {
+            center: [0.5, 0.5],
+            delta: [0.025, 0.01],
+            radius: 0.12,
+            softness: 0.7,
+            strength: 100.,
+        });
+        let dims = field_dimensions(&edit, image.dimensions());
+        let expected = warp(image.clone(), &edit, None);
+        edit.warps.push(WarpStroke {
+            center: [0.2, 0.3],
+            delta: [0.02, 0.01],
+            radius: 0.001,
+            softness: 0.7,
+            strength: 0.,
+        });
+        assert_eq!(field_dimensions(&edit, image.dimensions()), dims);
+        assert_eq!(warp(image, &edit, None), expected);
     }
 }

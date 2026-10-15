@@ -26,7 +26,7 @@ pub(super) struct PatchFrame {
     pub texture: egui::TextureHandle,
     pub original_texture: egui::TextureHandle,
     pub committed: bool,
-    patch: crate::cleanup::PatchStroke,
+    pub(super) patch: crate::cleanup::PatchStroke,
 }
 impl PatchFeedback {
     pub fn busy(&self) -> bool {
@@ -46,8 +46,10 @@ enum Blocker {
     Hidden,
     Transparent,
     Covered,
+    Masked,
     Group(LayerKind),
     HealingDisabled,
+    AdjustmentDisabled(Adjustment),
     Strength,
 }
 impl Blocker {
@@ -57,8 +59,10 @@ impl Blocker {
             Self::Hidden => "Selected layer is hidden. Show it to see your edits.",
             Self::Transparent => "Selected layer has 0% opacity.",
             Self::Covered => "An original-copy layer above hides this layer's edits.",
+            Self::Masked => "The layer mask hides this entire layer.",
             Self::Group(_) => "This tool is disabled in the saved layer settings.",
             Self::HealingDisabled => "Healing is disabled in this layer.",
+            Self::AdjustmentDisabled(_) => "This tool's adjustment is disabled or set to zero.",
             Self::Strength => "Brush strength is 0%.",
         }
     }
@@ -67,7 +71,8 @@ impl Blocker {
             Self::Locked | Self::Covered => "New retouch layer",
             Self::Hidden => "Show layer",
             Self::Transparent => "Set opacity to 100%",
-            Self::Group(_) | Self::HealingDisabled => "Enable tool",
+            Self::Masked => "Reveal layer mask",
+            Self::Group(_) | Self::HealingDisabled | Self::AdjustmentDisabled(_) => "Enable tool",
             Self::Strength => "Set strength to 100%",
         }
     }
@@ -75,7 +80,14 @@ impl Blocker {
 pub(super) fn is_manual(target: Target) -> bool {
     matches!(
         target,
-        Target::Liquify | Target::Heal | Target::Clone | Target::Patch
+        Target::Liquify
+            | Target::Heal
+            | Target::Clone
+            | Target::Patch
+            | Target::Clothing
+            | Target::Dodge
+            | Target::Burn
+            | Target::StrayHair
     )
 }
 impl HasturApp {
@@ -92,6 +104,13 @@ impl HasturApp {
             if layer.factor() == 0. {
                 return Some(Blocker::Transparent);
             }
+            if layer
+                .mask
+                .as_ref()
+                .is_some_and(|mask| mask.base == 0 && mask.strokes.is_empty())
+            {
+                return Some(Blocker::Masked);
+            }
             let index = edit
                 .stack
                 .layers
@@ -102,6 +121,9 @@ impl HasturApp {
                 l.kind == LayerType::OriginalCopy
                     && l.factor() == 1.
                     && l.blend == BlendMode::Normal
+                    && l.mask
+                        .as_ref()
+                        .is_none_or(|mask| mask.base == 255 && mask.strokes.is_empty())
             }) {
                 return Some(Blocker::Covered);
             }
@@ -109,18 +131,30 @@ impl HasturApp {
         let kind = match target {
             Target::Liquify => LayerKind::Liquify,
             Target::Heal => LayerKind::SpotHeal,
+            Target::StrayHair => LayerKind::SpotHeal,
             Target::Clone => LayerKind::CloneStamp,
             Target::Patch => LayerKind::Patch,
+            Target::Clothing => LayerKind::Portrait,
+            Target::Dodge | Target::Burn => LayerKind::Color,
             _ => unreachable!(),
         };
         if edit.layers.get(kind).factor() == 0. {
             return Some(Blocker::Group(kind));
         }
-        if target == Target::Heal && edit.settings.effective().healing <= 0. {
+        if matches!(target, Target::Heal | Target::StrayHair)
+            && edit.settings.effective().healing <= 0.
+        {
             return Some(Blocker::HealingDisabled);
         }
         if self.brush_strength <= 0. {
             return Some(Blocker::Strength);
+        }
+        let settings = edit.settings.effective();
+        if target == Target::Clothing && settings.clothing_wrinkles <= 0. {
+            return Some(Blocker::AdjustmentDisabled(Adjustment::ClothingWrinkles));
+        }
+        if matches!(target, Target::Dodge | Target::Burn) && settings.dodge_burn <= 0. {
+            return Some(Blocker::AdjustmentDisabled(Adjustment::DodgeBurn));
         }
         None
     }
@@ -147,6 +181,15 @@ impl HasturApp {
             Blocker::Transparent => {
                 photo.edit.active_layer_mut().unwrap().opacity = 100.;
             }
+            Blocker::Masked => {
+                if let Some(mask) = photo
+                    .edit
+                    .active_layer_mut()
+                    .and_then(|layer| layer.mask.as_mut())
+                {
+                    mask.base = 255;
+                }
+            }
             Blocker::Group(kind) => {
                 let group = photo.edit.layers.get_mut(kind);
                 group.visible = true;
@@ -159,6 +202,14 @@ impl HasturApp {
                     .disabled
                     .retain(|a| *a != Adjustment::Healing);
                 photo.edit.settings.healing = 100.;
+            }
+            Blocker::AdjustmentDisabled(adjustment) => {
+                photo.edit.settings.disabled.retain(|a| *a != adjustment);
+                match adjustment {
+                    Adjustment::ClothingWrinkles => photo.edit.settings.clothing_wrinkles = 100.,
+                    Adjustment::DodgeBurn => photo.edit.settings.dodge_burn = 0.75,
+                    _ => unreachable!(),
+                }
             }
             Blocker::Strength => self.brush_strength = 100.,
         }
@@ -191,6 +242,10 @@ impl HasturApp {
             let text = match target {
                 Target::Liquify => "Liquify · drag to push/pull",
                 Target::Heal => "Spot heal · click or drag over a defect",
+                Target::StrayHair => "Stray hair · trace individual strands with a small brush",
+                Target::Clothing => "Clothing · paint creases, preserving weave; avoid seams",
+                Target::Dodge => "Dodge · paint to brighten · −/+ changes size",
+                Target::Burn => "Burn · paint to deepen light · −/+ changes size",
                 Target::Clone if self.clone_pick_source => "Clone · click a clean source area",
                 Target::Clone
                     if !self
@@ -213,12 +268,50 @@ impl HasturApp {
                 120.
             } else {
                 0.
+            } + if matches!(target, Target::Heal | Target::Clone) {
+                150.
+            } else {
+                0.
+            } + if matches!(
+                target,
+                Target::Clothing | Target::StrayHair | Target::Dodge | Target::Burn
+            ) {
+                110.
+            } else {
+                0.
             };
             ui.add_sized(
                 vec2((ui.available_width() - reserve).max(70.), 34.),
                 egui::Label::new(RichText::new(text).size(11.).color(YELLOW)).truncate(),
             )
             .on_hover_text(text);
+            if matches!(
+                target,
+                Target::Clothing | Target::StrayHair | Target::Dodge | Target::Burn
+            ) {
+                let erase = ui.checkbox(&mut self.erase, "Erase repair");
+                hit(ui, "erase-painted-repair", erase.rect);
+            }
+            if matches!(target, Target::Heal | Target::Clone) {
+                let p = &mut self.photos[self.current];
+                let before = p.edit.clone();
+                let mut visible = p
+                    .edit
+                    .active_layer()
+                    .is_some_and(|layer| layer.sample_visible);
+                let sample = ui.checkbox(&mut visible, "Visible layers")
+                    .on_hover_text("Sample other visible layers, including layers above. Excludes the active layer to prevent self-copy feedback.");
+                hit(ui, "sample-visible-layers", sample.rect);
+                if sample.changed() {
+                    p.edit.ensure_stack();
+                    if let Some(layer) = p.edit.active_layer_mut() {
+                        layer.sample_visible = visible;
+                    }
+                    p.history.record(before);
+                    self.end_canvas_gesture();
+                    self.edited();
+                }
+            }
             if target == Target::Clone {
                 let pick = ui.button("Choose source");
                 hit(ui, "clone-pick-source", pick.rect);
@@ -235,6 +328,51 @@ impl HasturApp {
                     self.end_canvas_gesture();
                 }
             }
+        }
+    }
+    pub(super) fn mask_workspace_bar(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Layer mask").color(YELLOW));
+        let reveal = ui.checkbox(&mut self.erase, "Reveal");
+        hit(ui, "mask-reveal", reveal.rect);
+        ui.checkbox(&mut self.show_mask, "Overlay");
+        let short = self.photos[self.current]
+            .photo
+            .dimensions()
+            .0
+            .min(self.photos[self.current].photo.dimensions().1) as f32;
+        let mut diameter = self.brush_radius * short * 2.0;
+        let size = ui.add(
+            egui::DragValue::new(&mut diameter)
+                .range(2.0..=short * 0.3)
+                .speed(1.0)
+                .suffix(" px"),
+        );
+        if size.changed() {
+            self.brush_radius = diameter / (short * 2.0);
+        }
+        if ui.available_width() > 270.0 {
+            ui.add(
+                egui::DragValue::new(&mut self.brush_strength)
+                    .range(0.0..=100.0)
+                    .speed(1.0)
+                    .prefix("Strength ")
+                    .suffix("%"),
+            );
+            let mut softness = self.brush_softness * 100.0;
+            let soft = ui.add(
+                egui::DragValue::new(&mut softness)
+                    .range(0.0..=100.0)
+                    .speed(1.0)
+                    .prefix("Soft ")
+                    .suffix("%"),
+            );
+            if soft.changed() {
+                self.brush_softness = softness / 100.0;
+            }
+        }
+        if ui.button("Done").clicked() {
+            self.brush = None;
+            self.end_canvas_gesture();
         }
     }
     pub(super) fn reject_manual_stroke(&mut self) {
@@ -261,6 +399,7 @@ impl HasturApp {
         let a = mapping.source(start);
         let b = mapping.source(end);
         Some(crate::cleanup::PatchStroke {
+            feather: Some(self.brush_radius),
             boundary: self
                 .patch_draft
                 .boundary

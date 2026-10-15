@@ -1,0 +1,14 @@
+Hastur Retouch public beta - planned release October 6, 2026
+
+Portrait editing runs locally. No account or subscription is required.
+This package includes the AI models and CPU/DirectML runtimes; no Rust or Python installation is needed.
+
+Beta quality: review portraits at 100% and keep your original files.
+RAW camera files are not supported. JPEG, PNG, TIFF, WebP and BMP are supported.
+
+Feedback: suboptimald1@gmail.com
+Include the app version, Windows/GPU details, steps to reproduce, and the expected result.
+Only attach photographs or screenshots if you choose to share them.
+
+Windows signing status is recorded in release-manifest.json supplied with the download.
+Installing this beta does not disable or change Windows security settings.

@@ -57,6 +57,7 @@ fn tool_edit(target: Target, center: [f32; 2]) -> Edit {
             strength: 100.,
         }),
         Target::Patch => edit.patches.push(PatchStroke {
+            feather: None,
             boundary: vec![
                 [center[0] - 0.014, center[1] - 0.014],
                 [center[0] + 0.014, center[1] - 0.014],
@@ -113,7 +114,7 @@ fn diagnose(path: &Path, root: &Path) -> Result<()> {
         let source_path = p
             .path
             .clone()
-            .unwrap_or_else(|| PathBuf::from("example-img/demo-portrait.png"));
+            .unwrap_or_else(|| PathBuf::from("assets/demo-portrait.png"));
         let photo = engine::load_photo(&source_path)?;
         let before = engine::render(&photo.preview, &p.edit, None);
         let mut edit = p.edit.clone();
@@ -147,14 +148,7 @@ fn main() -> Result<()> {
     let mut report = String::from(
         "photo,tool,overview_changed_pixels,native_changed_pixels,overview_ms,native_ms\n",
     );
-    for (name, path, center) in [
-        ("demo", "example-img/demo-portrait.png", [0.62, 0.43]),
-        (
-            "original",
-            "example-img/CTU DUMANJUG ORG 09.28.26_JAMESBRO-522.JPG",
-            [0.54, 0.345],
-        ),
-    ] {
+    for (name, path, center) in [("demo", "assets/demo-portrait.png", [0.62, 0.43])] {
         let absolute = std::env::current_dir()?.join(path);
         let photo = engine::load_photo(&absolute)?;
         let original = photo.original.clone();

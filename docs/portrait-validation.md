@@ -54,6 +54,24 @@ Brightness deltas are measured RGB-byte luminance changes within pixels whose un
 
 Each fixture's `output/portrait-validation/<name>/results.txt` contains the counts, timing and mask-scope checks. The eye and hair artifacts are `left-eye-<case>-native.png`, `right-eye-<case>-native.png` and `hair-edge-<case>-native.png`. William Stitt's supplemental 640×480 lip/stubble review crops are in `output/portrait-validation/review/beard-<case>-native.png`; `beard-crop.txt` records the crop coordinates. A 501×768 crop centered on face-oval landmark 356 specifically checks the supplied portrait's previously circled temple/cheek hair boundary, in `review/supplied-temple-<case>-native.png`; `supplied-temple-crop.txt` records its coordinates. Auto Retouch, under-eye 100 and skin 100 retain that edge and overlapping wisps without the previously reported smear. These supplemental images are untouched rectangular samples of the native face renders, with no resizing.
 
+## Under-eye correction follow-up, 2026-10-04
+
+The earlier Eileen Collins result above exposed a problem: the neural texture target could darken the under-eye region even when the separate shadow correction was positive. The renderer now compares under-eye texture processing with the same edit without that contribution and prevents it from reducing local luminance. Other skin controls and deliberate exposure/color adjustments remain effective. The under-eye texture contribution is reduced, and the cheek reference uses robust middle/upper samples instead of an average dominated by local shadows. Full-image and native-region paths use the same reference calculation.
+
+Five fresh original-resolution runs used the existing ONNX Runtime CPU models, with no retraining. The supplied JPEG was read from its original clipboard attachment because its former `example-img` copy was unavailable. Source files were not changed. Results and unresized eye/hair crops are in `output/under-eye-final/<fixture>/`.
+
+| Fixture | Confident under-eye mean brightness change, 50 / 100 |
+| --- | ---: |
+| Studio demo | +5.027 / +9.692 bytes |
+| Eileen Collins | +1.190 / +2.371 bytes |
+| Grace Hopper | +3.556 / +6.863 bytes |
+| William Stitt | +6.362 / +11.947 bytes |
+| Supplied portrait | +3.988 / +7.749 bytes |
+
+Both strengths changed zero pixels outside the quantized under-eye mask on every fixture. Auto Retouch kept exposure/contrast at zero, and facial-only edits retained zero changes outside expanded face bounds. Native eye-crop review found local shadow lifting with eye shapes, lashes and glasses retained; the supplied hair-edge Auto Retouch crop retains its strands. The tiny 512-pixel fixtures provide limited detail for judging texture. Strong under-eye shadows remain partially visible, and the maximum setting is deliberately stronger than a natural default.
+
+The regression test checks that under-eye neural smoothing cannot deepen shadows, that user-selected negative exposure still darkens the final image, and that the native crop matches the corresponding full-image pixels. Positive byte-luminance changes establish direction and localization, not a universal perceptual-quality guarantee.
+
 ## Final flyaway cleanup review
 
 The detector requires agreeing background donors, broad background support around the candidate, and majority color-family agreement with the outer head-halo boundary. These guards prevent interior hair reflections from being treated as background. The final native review found no remaining visible hair speckling or contour smearing in these fixtures.

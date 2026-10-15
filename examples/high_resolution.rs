@@ -150,6 +150,7 @@ fn main() -> Result<()> {
         strength: 80.0,
     });
     edit.patches.push(hastur_retouch::cleanup::PatchStroke {
+        feather: None,
         boundary: vec![[0.39, 0.36], [0.40, 0.36], [0.40, 0.38], [0.39, 0.38]],
         offset: [0.025, 0.0],
         softness: 0.6,

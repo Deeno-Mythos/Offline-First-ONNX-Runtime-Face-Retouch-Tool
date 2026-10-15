@@ -1,5 +1,7 @@
 # Display profiling and SIMD, 2026-10-03
 
+The follow-up [manual-tool input feedback measurements](feedback-latency.md) cover the complete egui/worker/canvas path and the later native scheduling and fitted-preview changes. The measurements below remain the original individual display-stage comparison.
+
 The native CPU renderer already retains a sharp viewport and redraws local brush damage. This pass profiles the next stages: CPU display preparation, changed-pixel detection, GPU upload and conversion into the linear working texture. Liquify, Spot Heal, Clone Stamp and moving Patch donors use this display path.
 
 ## Kept changes
@@ -61,10 +63,11 @@ Stop compilation and other heavy work before recording timings. In PowerShell:
 
 ```powershell
 $env:CARGO_PROFILE_RELEASE_LTO='false'
-cargo build --release --locked -j2 --example display_profile --example gpu_upload_profile --example viewport_performance
-./target/release/examples/display_profile.exe --after
+cargo build --release --locked -j2 --example gpu_upload_profile --example viewport_performance
 ./target/release/examples/gpu_upload_profile.exe
 ./target/release/examples/viewport_performance.exe --gpu-profile
 ```
 
 Implementation: `src/pixel_changes.rs`, `src/gpu.rs`, `shaders/linear.wgsl`, `src/ui.rs` and `src/manual_tools.rs`. Headless profiling/readback helpers live in `src/gpu_diagnostics.rs`; they are not called by the application's render loop. See [live tools](live-tools.md) for CPU-render reuse, memory bounds and first-stroke limitations.
+
+The one-off `display_profile` helper was removed during beta preparation because it depended on a private photo no longer present. The measured results above remain historical; the maintained GPU and viewport profilers reproduce the current rendering checks.

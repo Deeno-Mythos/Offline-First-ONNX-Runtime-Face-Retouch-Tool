@@ -5,7 +5,11 @@ use hastur_retouch::{
     engine::{self, Edit, Renderer, Stroke, Target},
     geometry::WarpStroke,
 };
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
 fn append(edit: &mut Edit, tool: &str, index: usize) {
     let center = [
@@ -41,11 +45,19 @@ fn append(edit: &mut Edit, tool: &str, index: usize) {
 
 fn main() -> Result<()> {
     let reference = std::env::args().any(|a| a == "--reference");
-    let root = Path::new("output/live-tools");
-    std::fs::create_dir_all(root)?;
-    let photo = engine::load_photo(Path::new(
-        "example-img/CTU DUMANJUG ORG 09.28.26_JAMESBRO-522.JPG",
-    ))?;
+    let args: Vec<_> = std::env::args().collect();
+    let root = args
+        .iter()
+        .position(|a| a == "--output")
+        .and_then(|i| args.get(i + 1))
+        .map_or_else(|| PathBuf::from("output/live-tools"), PathBuf::from);
+    std::fs::create_dir_all(&root)?;
+    let source = args
+        .iter()
+        .position(|a| a == "--source")
+        .and_then(|i| args.get(i + 1))
+        .map_or("assets/demo-portrait.png", String::as_str);
+    let photo = engine::load_photo(Path::new(source))?;
     let mut report = String::from("mode,tool,median_ms,p95_ms\n");
     for native in [false, true] {
         let mode = if native { "native" } else { "preview" };

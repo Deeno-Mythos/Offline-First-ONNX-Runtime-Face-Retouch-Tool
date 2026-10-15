@@ -15,12 +15,36 @@ pub struct FlyawayMap {
     rows: Vec<usize>,
     pixels: Vec<Correction>,
 }
+
+/// Brush-guided repair, independent of the conservative automatic face/hair detector.
+pub fn selected(
+    image: &RgbaImage,
+    strokes: &[crate::engine::Stroke],
+    cancel: Option<&AtomicBool>,
+) -> Result<FlyawayMap> {
+    crate::painted_repair::selected(image, strokes, crate::engine::Target::StrayHair, cancel)
+}
 #[derive(Clone)]
 struct Correction {
     x: u32,
     delta: [f32; 3],
 }
 impl FlyawayMap {
+    pub(crate) fn from_rows(width: usize, data: Vec<Vec<(u32, [f32; 3])>>) -> Self {
+        let mut rows = Vec::with_capacity(data.len() + 1);
+        let mut pixels = Vec::new();
+        for row in data {
+            rows.push(pixels.len());
+            pixels.extend(row.into_iter().map(|(x, delta)| Correction { x, delta }));
+        }
+        rows.push(pixels.len());
+        Self {
+            width,
+            rows,
+            pixels,
+        }
+    }
+
     /// Sparse lookup in the source image's coordinate space, before any deformation.
     pub fn delta(&self, index: usize) -> [f32; 3] {
         if self.width == 0 {

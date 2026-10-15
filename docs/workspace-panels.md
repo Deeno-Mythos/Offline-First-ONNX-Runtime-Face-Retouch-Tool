@@ -41,7 +41,21 @@ The panel uses vector icons, large mouse targets, tooltips and disabled states f
 - **Copy adjustments**, **Paste adjustments** and **Reset adjustments** are the icons beside the blend selector. They affect settings only and preserve manual brush instructions. Paste and reset are disabled for locked layers. The copied settings can be pasted into another photograph's layer during the current app session.
 - With the Layers panel open, **Ctrl+Shift+N** creates a retouch layer, **Ctrl+J** duplicates, **Ctrl+[ / ]** moves down/up, **Delete** removes and **F2** renames. Text editing and open menus suppress these shortcuts. **Escape** cancels renaming. Locked layers disable opacity, blending, deletion, movement and editing while keeping their visibility and labels available.
 
-This is a non-destructive retouch/adjustment stack. Arbitrary imported raster assets, painted per-layer alpha masks, Photoshop document interchange, and Channels/Paths panels are not implemented. The older fixed tool-group controls remain supported in saved sessions.
+This is a non-destructive retouch/adjustment stack. Arbitrary imported raster assets, Photoshop document interchange, and Channels/Paths panels are not implemented. The older fixed tool-group controls remain supported in saved sessions.
+
+### Editable layer masks and visible sampling
+
+Select a layer and choose **Add layer mask**, then **Paint mask**, or click its black/white mask thumbnail. Black hides that layer; white reveals it. The canvas toolbar offers Reveal, an overlay of hidden areas, diameter and (when space permits) strength/softness. Space-drag pans without painting. Invert reverses the mask, and Remove restores the complete layer. Locked layers cannot change their masks.
+
+Masks store normalized brush instructions independently of the image pixels. They are applied after the layer's effects and deformation, so a mask stroke follows the displayed image coordinates. A gesture creates one undo step. Masks, inversion/removal, sampling options and their history are saved in workspaces and automatic recovery. Mask strokes share snapshot storage and count toward the existing undo-history memory budget; reopened current masks reuse equal saved stroke allocations. Old sessions default to no mask and the existing below-layer sampling. An appended mask stroke on the top layer updates only its visible footprint, unless a sampled lower layer depends on that upper layer.
+
+Heal and Clone offer **Visible layers** in the canvas toolbar and **Sample visible layers** in their brush settings. Disabled retains the existing immutable input beneath that layer. Enabled samples a composite of the other visible layers, including those above the active layer. The active layer is excluded to avoid self-copy feedback; donor layers use their below-layer sampling during this evaluation to avoid circular dependencies. This is a per-layer option and changing it updates the saved Heal/Clone instructions in that layer. Patch keeps its existing donor behavior.
+
+Sampling a lower layer can require rebuilding the full composite and is slower than the usual top-layer workflow. Hidden/zero-opacity donor layers are excluded, and masks/blending are respected. Painting beneath a partially masked image copy remains allowed. A completely black empty mask exposes a **Reveal layer mask** action when a manual tool would otherwise make invisible edits.
+
+`layer_stack_case --masks` writes the mask review workspace and verifies its original-resolution export in `output/layer-masks/`.
+
+Desktop, compact 600×560 and native 100% mask-workspace captures, plus the Heal visible-sampling toolbar, were reviewed from the release app in `output/layer-masks/{desktop,compact,native,heal}.png`. Each capture exited successfully with empty stderr. UI checks cover mask actions, display-coordinate painting, one-step gesture undo, per-layer sampling persistence/undo and legacy flat-edit migration. Render checks cover full/native mask parity and upper-layer donors for both Heal and Clone; an upper edit forces a complete redraw when it can change a distant lower-layer sampled repair.
 
 Native requests reuse the composite below the top visible layer. Prefix images are limited to two and 192 MiB; existing source/filter caches keep their own limits. Editing a lower layer invalidates later composites and can take longer than editing the top layer. Session saving stores instructions and references to originals, rather than a resized image.
 

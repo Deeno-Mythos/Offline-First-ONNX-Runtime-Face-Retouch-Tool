@@ -1,0 +1,125 @@
+{
+  "files": [
+    {
+      "sha256": "2f2689b040becf555706d2cb978d2f0e3296ea82413734fba9a856c66c5f2b17",
+      "source": "models/face_detection_short_range.onnx",
+      "destination": "models/face_detection_short_range.onnx"
+    },
+    {
+      "sha256": "111795f8703cdeb6d0c68a9f3cc966a0f23f8786bb00f4577a11f461fc4276ac",
+      "source": "models/face_landmarker_Nx3x256x256.onnx",
+      "destination": "models/face_landmarker_Nx3x256x256.onnx"
+    },
+    {
+      "sha256": "348da8ed8114d0951cfb1e5026fd6ed4c70a087e92ab8a7421723b96b666cb40",
+      "source": "models/retouch_generator.onnx",
+      "destination": "models/retouch_generator.onnx"
+    },
+    {
+      "sha256": "52185c535326a4feb432db5c715e512fae6198f244d9aa7756652af62c46d8dc",
+      "source": "models/local_detection.onnx",
+      "destination": "models/local_detection.onnx"
+    },
+    {
+      "sha256": "fccbae44ae5c4487b164d4d511a2922f9177bba55b54ec7c983c30b35e410ea2",
+      "source": "models/local_inpainting.onnx",
+      "destination": "models/local_inpainting.onnx"
+    },
+    {
+      "sha256": "b95efb2113b603bbbf3f191061c5516a871ed546893c820e4f3b7b6c358dbf2a",
+      "source": "models/onnxruntime.dll",
+      "destination": "models/onnxruntime.dll"
+    },
+    {
+      "sha256": "f2540b89707b47895c2a732bfd04e34a695c580d22301ef44c0f01f09b001673",
+      "source": "models/onnxruntime_providers_shared.dll",
+      "destination": "models/onnxruntime_providers_shared.dll"
+    },
+    {
+      "sha256": "e7eedec6a6f26dc39dc948276a75ef6d2bee3fff944d874ceed0bbd3b97bff40",
+      "source": "models/directml/onnxruntime.dll",
+      "destination": "models/directml/onnxruntime.dll"
+    },
+    {
+      "sha256": "265c8daf29637cb259cac8be9f08f2cd45f3883f0f0e4949cbfddd5b4cbec3b6",
+      "source": "models/directml/onnxruntime_providers_shared.dll",
+      "destination": "models/directml/onnxruntime_providers_shared.dll"
+    },
+    {
+      "sha256": "9c9e6d822561c6c41b90e6994b3e8857cf1d66dbfb1e0c4c799c7c89b4e92da1",
+      "source": "models/directml/DirectML.dll",
+      "destination": "models/directml/DirectML.dll"
+    },
+    {
+      "source": "models/burn/face_detection_short_range.bpk",
+      "destination": "models/burn/face_detection_short_range.bpk",
+      "generatedFrom": "models/face_detection_short_range.onnx"
+    },
+    {
+      "source": "models/burn/face_landmarker_Nx3x256x256.bpk",
+      "destination": "models/burn/face_landmarker_Nx3x256x256.bpk",
+      "generatedFrom": "models/face_landmarker_Nx3x256x256.onnx"
+    },
+    {
+      "source": "models/burn/retouch_generator.bpk",
+      "destination": "models/burn/retouch_generator.bpk",
+      "generatedFrom": "models/retouch_generator.onnx"
+    },
+    {
+      "source": "models/burn/local_detection.bpk",
+      "destination": "models/burn/local_detection.bpk",
+      "generatedFrom": "models/local_detection.onnx"
+    },
+    {
+      "source": "models/burn/local_inpainting.bpk",
+      "destination": "models/burn/local_inpainting.bpk",
+      "generatedFrom": "models/local_inpainting.onnx"
+    },
+    {
+      "sha256": "2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c",
+      "source": "models/LICENSE",
+      "destination": "models/LICENSE"
+    },
+    {
+      "sha256": "0e07b95f3a8d6230037707c5c4a2b554d12c4cb67369669ac255635528ffcee2",
+      "source": "models/ThirdPartyNotices.txt",
+      "destination": "models/ThirdPartyNotices.txt"
+    },
+    {
+      "sha256": "5be6cf80c710a3ec4fc2c269119b00ba714c58acb3cb1e0225a86e3d0c37084b",
+      "source": "models/LICENSE-mediapipe.txt",
+      "destination": "models/LICENSE-mediapipe.txt"
+    },
+    {
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "source": "models/LICENSE-modelscope.txt",
+      "destination": "models/LICENSE-modelscope.txt"
+    },
+    {
+      "sha256": "c250d6278f0b47a6439fb7592b08b58a55eb9f535aa49a1db63211c3f982b674",
+      "source": "models/directml/LICENSE",
+      "destination": "models/directml/LICENSE"
+    },
+    {
+      "sha256": "fb0af774b4d7cffc5b9d046f2aaeade2f37df2f80abf8033c95dfffcc77a8866",
+      "source": "models/directml/ThirdPartyNotices.txt",
+      "destination": "models/directml/ThirdPartyNotices.txt"
+    },
+    {
+      "sha256": "a05138e3a085ff60a44881eedfa58dccb03ecc1d7b1f6ae888418e8c2fec4b8d",
+      "source": "models/directml/DirectML-LICENSE.txt",
+      "destination": "models/directml/DirectML-LICENSE.txt"
+    },
+    {
+      "sha256": "903df5512f7d02609fed0c780a9b704f5a3eeb6e4d84ebe42a29845c81899a3c",
+      "source": "models/directml/DirectML-LICENSE-CODE.txt",
+      "destination": "models/directml/DirectML-LICENSE-CODE.txt"
+    },
+    {
+      "sha256": "907bff1406c9c5e4e512d944f9105e70dde2c075c977d9ddb7a6880496c6e394",
+      "source": "LICENSE",
+      "destination": "LICENSE"
+    }
+  ],
+  "schema": 1
+}

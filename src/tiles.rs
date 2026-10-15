@@ -135,8 +135,7 @@ fn references(
         .iter()
         .flat_map(|face| crate::model::portrait::eye_regions(face, w, h))
         .map(|eye| {
-            let mut sum = 0.0;
-            let mut count = 0;
+            let mut cheek_samples = Vec::with_capacity(9);
             for below in [0.78, 0.98, 1.18] {
                 for across in [-0.2, 0.0, 0.2] {
                     let x = eye.lower[0]
@@ -157,7 +156,7 @@ fn references(
                         image,
                         edit,
                         Some(seg),
-                        [false, false, false, true, false],
+                        [false, false, false, true, false, false, false, false],
                         Crop {
                             x: px,
                             y: py,
@@ -168,16 +167,18 @@ fn references(
                     if masks.value(0, 3) > 0.18 {
                         continue;
                     }
-                    sum += lum(&sampler.at(px, py));
-                    count += 1;
+                    cheek_samples.push(lum(&sampler.at(px, py)));
                 }
             }
-            let luma = if count == 0 {
+            let luma = if cheek_samples.is_empty() {
                 let x = (eye.lower[0] + eye.down[0] * eye.width).round() as u32;
                 let y = (eye.lower[1] + eye.down[1] * eye.width).round() as u32;
                 lum(&sampler.at(x.min(w - 1), y.min(h - 1)))
             } else {
-                sum / count as f32
+                cheek_samples.sort_by(f32::total_cmp);
+                (cheek_samples[cheek_samples.len() / 2]
+                    + cheek_samples[cheek_samples.len() * 3 / 4])
+                    * 0.5
             };
             UnderEyeReference { eye, luma }
         })
@@ -214,7 +215,7 @@ fn shadow_lift(
                     d(a).total_cmp(&d(b))
                 })
                 .unwrap();
-            (reference.luma - lum_half(&low[i]) - 0.012).clamp(0.0, 0.12) * region * 0.9
+            (reference.luma - lum_half(&low[i]) - 0.008).clamp(0.0, 0.12) * region * 0.9
         })
         .collect()
 }
@@ -226,6 +227,8 @@ struct Prepared<'a> {
     s: Settings,
     color: crate::color::PreparedColor,
     flyaway: Option<Arc<crate::flyaway::FlyawayMap>>,
+    selected_hair: Option<Arc<crate::flyaway::FlyawayMap>>,
+    selected_clothing: Option<Arc<crate::flyaway::FlyawayMap>>,
     cleanup: Option<Arc<crate::cleanup::PreparedCleanup>>,
     #[cfg(feature = "onnx")]
     eyes: Arc<Vec<UnderEyeReference>>,
@@ -237,6 +240,8 @@ pub(super) struct NativeCache {
     warp: crate::geometry::WarpCache,
     segmentation: Option<Arc<Segmentation>>,
     flyaway: Option<Arc<crate::flyaway::FlyawayMap>>,
+    selected_hair: Option<(SharedVec<Stroke>, Arc<crate::flyaway::FlyawayMap>)>,
+    selected_clothing: Option<(SharedVec<Stroke>, Arc<crate::flyaway::FlyawayMap>)>,
     cleanup_key: Option<Edit>,
     cleanup: Option<Arc<crate::cleanup::PreparedCleanup>>,
     donor_blur: BlurTiles,
@@ -246,6 +251,11 @@ pub(super) struct NativeCache {
 impl NativeCache {
     pub(super) fn bytes(&self) -> usize {
         self.flyaway.as_ref().map_or(0, |m| m.bytes())
+            + self.selected_hair.as_ref().map_or(0, |(_, m)| m.bytes())
+            + self
+                .selected_clothing
+                .as_ref()
+                .map_or(0, |(_, m)| m.bytes())
             + self.warp.bytes()
             + self.cleanup.as_ref().map_or(0, |m| m.bytes())
             + self.segmentation.as_ref().map_or(0, |s| s.map_bytes())
@@ -357,6 +367,42 @@ impl<'a> Prepared<'a> {
         } else {
             None
         };
+        let selected_hair =
+            if s.healing != 0. && edit.strokes.iter().any(|p| p.target == Target::StrayHair) {
+                let make = || crate::flyaway::selected(image, &edit.strokes, cancel).map(Arc::new);
+                if let Some(c) = cache.as_mut() {
+                    if c.selected_hair.as_ref().is_none_or(|(strokes, _)| {
+                        !strokes.same_storage(&edit.strokes) && *strokes != edit.strokes
+                    }) {
+                        c.selected_hair = Some((edit.strokes.clone(), make()?));
+                    }
+                    c.selected_hair.as_ref().map(|(_, m)| m.clone())
+                } else {
+                    Some(make()?)
+                }
+            } else {
+                None
+            };
+        let selected_clothing = if s.clothing_wrinkles != 0.
+            && edit.strokes.iter().any(|p| p.target == Target::Clothing)
+        {
+            let make = || {
+                crate::painted_repair::selected(image, &edit.strokes, Target::Clothing, cancel)
+                    .map(Arc::new)
+            };
+            if let Some(c) = cache.as_mut() {
+                if c.selected_clothing.as_ref().is_none_or(|(strokes, _)| {
+                    !strokes.same_storage(&edit.strokes) && *strokes != edit.strokes
+                }) {
+                    c.selected_clothing = Some((edit.strokes.clone(), make()?));
+                }
+                c.selected_clothing.as_ref().map(|(_, m)| m.clone())
+            } else {
+                Some(make()?)
+            }
+        } else {
+            None
+        };
         #[cfg(feature = "onnx")]
         let eyes = if s.under_eyes != 0.0 {
             if let Some(c) = cache.as_mut() {
@@ -383,6 +429,8 @@ impl<'a> Prepared<'a> {
             s,
             color,
             flyaway,
+            selected_hair,
+            selected_clothing,
             cleanup,
             #[cfg(feature = "onnx")]
             eyes,
@@ -393,7 +441,8 @@ impl<'a> Prepared<'a> {
         let (w, h) = self.image.dimensions();
         let s = &self.s;
         let radius = (w.min(h) as f32 * 0.003).round().max(1.0) as usize;
-        let texture = s.smoothing != 0.0
+        let texture = s.skin_tone.active()
+            || s.smoothing != 0.0
             || s.tone_evenness != 0.0
             || s.under_eyes != 0.0
             || s.forehead != 0.0
@@ -443,11 +492,17 @@ impl<'a> Prepared<'a> {
         });
         check_cancel(cancel)?;
         let targets = [
-            s.smoothing != 0.0 || s.tone_evenness != 0.0 || s.redness != 0.0,
+            s.smoothing != 0.0
+                || s.tone_evenness != 0.0
+                || s.redness != 0.0
+                || s.skin_tone.active(),
             s.teeth != 0.0,
             s.eyes != 0.0,
             s.under_eyes != 0.0,
             s.background != Background::Original,
+            false, // Fabric repairs contain their painted coverage.
+            s.dodge_burn != 0. && self.edit.strokes.iter().any(|p| p.target == Target::Dodge),
+            s.dodge_burn != 0. && self.edit.strokes.iter().any(|p| p.target == Target::Burn),
         ];
         let masks = local_layers_region(self.image, self.edit, self.seg, targets, region);
         let lift = if s.under_eyes != 0.0 {
@@ -487,19 +542,22 @@ impl<'a> Prepared<'a> {
             under_eye_lift: lift.as_deref(),
             healed: healed.as_deref(),
             flyaway: self.flyaway.as_deref(),
+            selected_hair: self.selected_hair.as_deref(),
+            selected_clothing: self.selected_clothing.as_deref(),
             seg: self.seg,
             cancel,
         });
         check_cancel(cancel)?;
         let padded = RgbaImage::from_raw(region.width, region.height, output).unwrap();
-        Ok(image::imageops::crop_imm(
+        Ok(crate::pixel_region::crop(
             &padded,
-            core.x - region.x,
-            core.y - region.y,
-            core.width,
-            core.height,
-        )
-        .to_image())
+            Crop {
+                x: core.x - region.x,
+                y: core.y - region.y,
+                width: core.width,
+                height: core.height,
+            },
+        ))
     }
     fn unwarped(&self, crop: Crop, cancel: Option<&AtomicBool>) -> Result<RgbaImage> {
         let mut output = RgbaImage::new(crop.width, crop.height);
@@ -746,6 +804,7 @@ mod tests {
             strength: 60.0,
         });
         edit.patches.push(crate::cleanup::PatchStroke {
+            feather: None,
             boundary: vec![[0.46, 0.61], [0.56, 0.61], [0.56, 0.75], [0.46, 0.75]],
             offset: [-0.25, -0.5],
             softness: 0.7,
