@@ -148,6 +148,12 @@ impl FrameProfiler {
         }
         Ok(start.elapsed().as_secs_f64() * 1000.0)
     }
+    pub fn canvas_upload_pixels(&self) -> [u64; 2] {
+        self.renderer
+            .callback_resources
+            .get::<Resources>()
+            .map_or([0; 2], |r| r.upload_pixels)
+    }
     pub fn screenshot(&self) -> Result<RgbaImage> {
         let [w, h] = self.size;
         let stride = (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)

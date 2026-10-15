@@ -65,6 +65,7 @@ impl PortraitDemand {
             .any(active);
         let blemishes = active(s.blemishes);
         let geometry = skin
+            || s.skin_tone.active()
             || blemishes
             || [
                 s.tone_evenness,

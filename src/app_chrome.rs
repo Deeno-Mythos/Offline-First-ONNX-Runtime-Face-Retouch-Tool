@@ -146,6 +146,20 @@ fn commands() -> Vec<Command> {
             Icon::Clone,
         ),
         (Brush(Target::Patch), "Use patch tool", "", Icon::Patch),
+        (
+            Brush(Target::Clothing),
+            "Paint clothing wrinkle removal",
+            "",
+            Icon::Heal,
+        ),
+        (
+            Brush(Target::StrayHair),
+            "Remove stray hair with brush",
+            "",
+            Icon::Heal,
+        ),
+        (Brush(Target::Dodge), "Dodge brush", "", Icon::Adjust),
+        (Brush(Target::Burn), "Burn brush", "", Icon::Adjust),
         (StopBrush, "Stop active brush", "Escape", Icon::Close),
         (Previous, "Previous photo", "Left", Icon::Up),
         (Next, "Next photo", "Right", Icon::Down),
@@ -631,7 +645,11 @@ impl HasturApp {
                 if self.brush != Some(target) {
                     self.toggle_brush(target);
                 }
-                self.tool = super::Tool::Portrait;
+                self.tool = if matches!(target, Target::Dodge | Target::Burn) {
+                    super::Tool::Color
+                } else {
+                    super::Tool::Portrait
+                };
                 self.inspector = Some(Inspector::Tools);
                 self.last_inspector = Inspector::Tools;
                 self.compact_open = true;
@@ -916,8 +934,39 @@ impl HasturApp {
         }
     }
 
+    pub(super) fn brush_size_shortcuts(&mut self, ctx: &egui::Context) {
+        if egui::Popup::is_any_open(ctx)
+            || self.export_open
+            || self.export_queue_open
+            || self.preferences_open
+            || self.command_open
+            || self.help
+        {
+            return;
+        }
+        if self.brush.is_some() {
+            for (key, factor) in [
+                (egui::Key::Minus, 0.8),
+                (egui::Key::Plus, 1.25),
+                (egui::Key::Equals, 1.25),
+            ] {
+                let resize = pressed(ctx, egui::Modifiers::NONE, key)
+                    || (key != egui::Key::Minus && pressed(ctx, egui::Modifiers::SHIFT, key));
+                if resize {
+                    self.resize_brush(factor);
+                }
+            }
+        }
+    }
+
     pub(super) fn micro_shortcuts(&mut self, ctx: &egui::Context) {
-        if egui::Popup::is_any_open(ctx) || self.export_open || self.help {
+        if egui::Popup::is_any_open(ctx)
+            || self.export_open
+            || self.export_queue_open
+            || self.preferences_open
+            || self.command_open
+            || self.help
+        {
             return;
         }
         if self.brush.is_some() {
@@ -926,7 +975,7 @@ impl HasturApp {
                 (egui::Key::CloseBracket, 1.25, 5.),
             ] {
                 if pressed(ctx, egui::Modifiers::NONE, key) {
-                    self.brush_radius = (self.brush_radius * factor).clamp(0.002, 0.09);
+                    self.resize_brush(factor);
                 }
                 if pressed(ctx, egui::Modifiers::SHIFT, key) {
                     self.brush_strength = (self.brush_strength + delta).clamp(1., 100.);
@@ -970,5 +1019,12 @@ impl HasturApp {
                 self.photos[self.current].rating = 0;
             }
         }
+    }
+
+    fn resize_brush(&mut self, factor: f32) {
+        let short = self.photos.get(self.current).map_or(500., |p| {
+            p.photo.dimensions().0.min(p.photo.dimensions().1) as f32
+        });
+        self.brush_radius = (self.brush_radius * factor).clamp(1. / short.max(7.), 0.15);
     }
 }

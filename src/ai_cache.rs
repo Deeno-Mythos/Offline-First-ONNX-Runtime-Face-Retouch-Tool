@@ -19,6 +19,8 @@ const MODELS: &[&str] = &[
 // File-format identifiers and the hash seed intentionally stay stable across the rename.
 const SIGNATURE: &[u8; 8] = b"ASTRAAI2";
 const COMPACT_SIGNATURE: &[u8; 8] = b"ASTRAAI3";
+const STAGED_SIGNATURE: &[u8; 8] = b"ASTRAAI4";
+const MAX_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 struct MemoryEntry {
     path: PathBuf,
     stamp: (u64, std::time::SystemTime),
@@ -228,12 +230,12 @@ pub(crate) fn load_shared(
     associate(image, &seg, provider);
     Some(seg)
 }
-fn number(reader: &mut impl Read) -> Result<u32> {
+fn number(reader: &mut (impl Read + ?Sized)) -> Result<u32> {
     let mut bytes = [0; 4];
     reader.read_exact(&mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
 }
-fn values(reader: &mut impl Read, n: usize) -> Result<Vec<f32>> {
+fn values(reader: &mut (impl Read + ?Sized), n: usize) -> Result<Vec<f32>> {
     let mut values = vec![0.0f32; n];
     reader.read_exact(bytemuck::cast_slice_mut(&mut values))?;
     #[cfg(target_endian = "big")]
@@ -243,7 +245,7 @@ fn values(reader: &mut impl Read, n: usize) -> Result<Vec<f32>> {
     ensure!(values.iter().all(|v| v.is_finite()), "Invalid cache values");
     Ok(values)
 }
-fn vector(reader: &mut impl Read, n: usize, full: usize) -> Result<SharedVec<f32>> {
+fn vector(reader: &mut (impl Read + ?Sized), n: usize, full: usize) -> Result<SharedVec<f32>> {
     let count = number(reader)? as usize;
     ensure!(
         count == 0 || count == n || count == full,
@@ -251,7 +253,7 @@ fn vector(reader: &mut impl Read, n: usize, full: usize) -> Result<SharedVec<f32
     );
     values(reader, count).map(SharedVec::from)
 }
-fn rgb(reader: &mut impl Read, n: usize, full: usize) -> Result<SharedVec<[f32; 3]>> {
+fn rgb(reader: &mut (impl Read + ?Sized), n: usize, full: usize) -> Result<SharedVec<[f32; 3]>> {
     let count = number(reader)? as usize;
     ensure!(
         count == 0 || count == n || count == full,
@@ -270,15 +272,59 @@ fn rgb(reader: &mut impl Read, n: usize, full: usize) -> Result<SharedVec<[f32; 
     Ok(data.into())
 }
 fn read(reader: &mut impl Read, dims: (u32, u32)) -> Result<Segmentation> {
+    read_inner(reader, dims, true)
+}
+fn read_inner(reader: &mut dyn Read, dims: (u32, u32), envelope: bool) -> Result<Segmentation> {
     let mut signature = [0; 8];
     reader.read_exact(&mut signature)?;
+    if &signature == STAGED_SIGNATURE {
+        ensure!(envelope, "Nested AI cache envelope");
+        let mut header = [0; 2];
+        reader.read_exact(&mut header)?;
+        let [bits, compression] = header;
+        ensure!(
+            bits > 0 && bits <= 7 && bits & 1 != 0,
+            "Invalid cached AI readiness"
+        );
+        let prepared = crate::nullstate::PortraitDemand {
+            geometry: true,
+            skin: bits & 2 != 0,
+            blemishes: bits & 4 != 0,
+        };
+        let mut seg = match compression {
+            0 => read_inner(&mut reader.take(MAX_CACHE_BYTES + 1), dims, false)?,
+            1 => {
+                let mut decoder = flate2::bufread::ZlibDecoder::new(BufReader::new(reader));
+                let seg = read_inner(&mut decoder.by_ref().take(MAX_CACHE_BYTES + 1), dims, false)?;
+                ensure!(decoder.total_out() <= MAX_CACHE_BYTES, "Oversized AI cache");
+                let mut rest = decoder.into_inner();
+                let mut extra = [0];
+                ensure!(
+                    rest.read(&mut extra)? == 0,
+                    "Unexpected compressed cache payload"
+                );
+                seg
+            }
+            _ => anyhow::bail!("Unknown AI cache encoding"),
+        };
+        ensure!(
+            seg.faces.is_empty() || !prepared.skin || !seg.neural_blend.is_empty(),
+            "Missing cached skin stage"
+        );
+        ensure!(
+            seg.faces.is_empty() || !prepared.blemishes || !seg.repair_delta.is_empty(),
+            "Missing cached repair stage"
+        );
+        seg.prepared = prepared;
+        return Ok(seg);
+    }
     ensure!(
         &signature == SIGNATURE || &signature == COMPACT_SIGNATURE,
         "Old cache"
     );
     let (w, h) = (number(reader)?, number(reader)?);
     ensure!(
-        (w, h) == dims && w * h <= 2_100_000,
+        (w, h) == dims && w > 0 && h > 0 && u64::from(w) * u64::from(h) <= 2_100_000,
         "Invalid cache dimensions"
     );
     let full = (w * h) as usize;
@@ -406,17 +452,46 @@ fn write_values(writer: &mut impl Write, data: &[f32]) -> Result<()> {
     }
     Ok(())
 }
+fn write_staged(writer: &mut impl Write, seg: &Segmentation) -> Result<()> {
+    ensure!(seg.prepared.geometry, "Cannot cache unprepared geometry");
+    let bits = 1 | (u8::from(seg.prepared.skin) << 1) | (u8::from(seg.prepared.blemishes) << 2);
+    // Partial maps are cheap to compress and otherwise were recomputed on every
+    // reopen. Leave complete maps raw to preserve fast full-cache reads on SSDs.
+    let compressed = !seg.prepared.contains(crate::nullstate::PortraitDemand::ALL);
+    writer.write_all(STAGED_SIGNATURE)?;
+    writer.write_all(&[bits, u8::from(compressed)])?;
+    if compressed {
+        let mut encoder = flate2::write::ZlibEncoder::new(writer, flate2::Compression::fast());
+        write(&mut encoder, seg)?;
+        encoder.finish()?;
+    } else {
+        write(writer, seg)?;
+    }
+    Ok(())
+}
 pub fn save(image: &RgbaImage, seg: &Segmentation, provider: crate::model::Provider) -> Result<()> {
     let Some([path, ..]) = paths(image, provider) else {
         return Ok(());
     };
     let dir = path.parent().unwrap();
     fs::create_dir_all(dir)?;
-    let temp = path.with_extension("tmp");
-    let mut writer = BufWriter::new(File::create(&temp)?);
-    write(&mut writer, seg)?;
-    writer.flush()?;
-    drop(writer);
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), serial));
+    let result = (|| -> Result<()> {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        let mut writer = BufWriter::new(file);
+        write_staged(&mut writer, seg)?;
+        writer.flush()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
     // Renaming a completed file makes cancellation or power loss recoverable.
     if path.exists() {
         fs::remove_file(&path)?;
@@ -453,6 +528,60 @@ fn trim(dir: &Path, current: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn staged_cache_keeps_exact_partial_readiness_and_compresses_without_quantizing() {
+        for prepared in [
+            crate::nullstate::PortraitDemand::GEOMETRY,
+            crate::nullstate::PortraitDemand {
+                skin: true,
+                ..crate::nullstate::PortraitDemand::GEOMETRY
+            },
+            crate::nullstate::PortraitDemand::ALL,
+        ] {
+            let seg = Segmentation {
+                prepared,
+                width: 128,
+                height: 128,
+                skin: vec![0.34; 128 * 128].into(),
+                neural_blend: if prepared.skin {
+                    vec![[0.49991, 0.50003, 0.6]; 128 * 128].into()
+                } else {
+                    Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bytes = vec![];
+            write_staged(&mut bytes, &seg).unwrap();
+            let decoded = read(&mut bytes.as_slice(), (128, 128)).unwrap();
+            assert_eq!(decoded.prepared, prepared);
+            assert_eq!(decoded.skin, seg.skin);
+            assert_eq!(decoded.neural_blend, seg.neural_blend);
+            assert!(read(&mut &bytes[..bytes.len() - 1], (128, 128)).is_err());
+            let mut extra = bytes.clone();
+            extra.push(0);
+            assert!(read(&mut extra.as_slice(), (128, 128)).is_err());
+            if !prepared.contains(crate::nullstate::PortraitDemand::ALL) {
+                let mut raw = vec![];
+                write(&mut raw, &seg).unwrap();
+                assert!(bytes.len() * 10 < raw.len());
+                let last = bytes.len() - 1;
+                bytes[last] ^= 1;
+                assert!(read(&mut bytes.as_slice(), (128, 128)).is_err());
+            }
+        }
+    }
+    #[test]
+    fn malformed_readiness_and_recursive_envelopes_are_rejected() {
+        for bits in [0, 2, 4, 8, 255] {
+            let mut bytes = STAGED_SIGNATURE.to_vec();
+            bytes.extend_from_slice(&[bits, 0]);
+            assert!(read(&mut bytes.as_slice(), (128, 128)).is_err());
+        }
+        let mut bytes = STAGED_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&[1, 0]);
+        bytes.extend_from_slice(STAGED_SIGNATURE);
+        assert!(read(&mut bytes.as_slice(), (128, 128)).is_err());
+    }
     #[test]
     fn installed_cache_writes_are_separate_from_read_only_legacy_models() {
         let paths = cache_paths(

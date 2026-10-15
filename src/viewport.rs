@@ -165,12 +165,20 @@ fn manual_damage(
     let mut source = Bounds::default();
     let mut destination = Bounds::default();
     for stroke in &b.strokes[a.strokes.len()..] {
-        if stroke.target != Target::Heal {
+        if !matches!(
+            stroke.target,
+            Target::Heal | Target::Clothing | Target::Dodge | Target::Burn | Target::StrayHair
+        ) {
             return None;
         }
         source.point(
             stroke.center,
-            stroke.radius.max(1. / dims.0.min(dims.1) as f32),
+            stroke.radius.max(1. / dims.0.min(dims.1) as f32)
+                + if stroke.target == Target::StrayHair {
+                    4. / dims.0.min(dims.1) as f32
+                } else {
+                    0.
+                },
             dims,
         );
     }
@@ -253,11 +261,16 @@ impl Renderer {
                         return Err(error);
                     }
                 };
-                image::imageops::replace(
-                    &mut frame.image,
+                crate::pixel_region::copy_into(
                     &patch,
-                    (damage.x - crop.x) as i64,
-                    (damage.y - crop.y) as i64,
+                    Crop {
+                        x: 0,
+                        y: 0,
+                        width: patch.width(),
+                        height: patch.height(),
+                    },
+                    &mut frame.image,
+                    [damage.x - crop.x, damage.y - crop.y],
                 );
             }
             frame.edit = edit.clone();
@@ -397,6 +410,7 @@ mod tests {
                 strength: 90.,
             }),
             Target::Patch => edit.patches.push(PatchStroke {
+                feather: None,
                 boundary: vec![
                     [center[0] - 0.02, center[1] - 0.02],
                     [center[0] + 0.02, center[1] - 0.02],
@@ -439,6 +453,44 @@ mod tests {
             renderer.viewport_damage()
         );
     }
+    #[test]
+    fn growing_fabric_and_curved_hair_repairs_match_complete_native_pixels() {
+        let image = Arc::new(RgbaImage::from_fn(512, 384, |x, y| {
+            let fold = (-0.5 * ((x as f32 - 300.) / 8.).powi(2)).exp() * 45.;
+            let hair = if x == 180 + (y / 16) % 5 { 35. } else { 0. };
+            let level = (180. + ((x + y) % 2) as f32 * 3. - fold - hair) as u8;
+            image::Rgba([level, level, level, 255])
+        }));
+        let crop = Crop {
+            x: 130,
+            y: 40,
+            width: 230,
+            height: 200,
+        };
+        for target in [Target::Clothing, Target::StrayHair] {
+            let mut edit = Edit::default();
+            let mut renderer = Renderer::default();
+            verify(&mut renderer, &image, &edit, None, crop);
+            for y in (80..140).step_by(4) {
+                let x = if target == Target::Clothing {
+                    300.
+                } else {
+                    (180 + (y / 16) % 5) as f32
+                };
+                edit.strokes.push(Stroke {
+                    target,
+                    center: [x / 512., y as f32 / 384.],
+                    radius: 0.025,
+                    softness: 0.5,
+                    strength: 100.,
+                    erase: false,
+                });
+                verify(&mut renderer, &image, &edit, None, crop);
+                assert_ne!(renderer.viewport_damage(), Some(crop));
+            }
+        }
+    }
+
     #[test]
     fn growing_manual_strokes_redraw_only_their_footprints_without_changing_other_pixels() {
         let (image, crop) = fixture();

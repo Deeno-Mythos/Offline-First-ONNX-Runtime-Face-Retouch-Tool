@@ -3906,6 +3906,7 @@ dependencies = [
  "crossbeam-channel",
  "eframe",
  "egui-wgpu",
+ "flate2",
  "glam",
  "half",
  "image",

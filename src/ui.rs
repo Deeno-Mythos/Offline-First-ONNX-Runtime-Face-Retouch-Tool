@@ -20,7 +20,7 @@ use eframe::egui::{
 };
 use image::RgbaImage;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
         Arc, Weak,
@@ -29,9 +29,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const BG: Color32 = Color32::from_rgb(11, 11, 12);
-const PANEL: Color32 = Color32::from_rgb(20, 20, 22);
-const RAISED: Color32 = Color32::from_rgb(29, 29, 31);
+const BG: Color32 = Color32::from_rgb(7, 8, 9);
+const PANEL: Color32 = Color32::from_rgb(28, 30, 32);
+const RAISED: Color32 = Color32::from_rgb(40, 42, 44);
 const YELLOW: Color32 = Color32::from_rgb(255, 214, 10);
 const TEXT: Color32 = Color32::from_rgb(239, 239, 241);
 const MUTED: Color32 = Color32::from_rgb(146, 146, 154);
@@ -39,8 +39,18 @@ const BORDER: Color32 = Color32::from_rgb(39, 39, 43);
 
 #[path = "asset_workflow.rs"]
 mod asset_workflow;
+#[path = "batch_workflow.rs"]
+mod batch_workflow;
+#[path = "document_tools.rs"]
+mod document_tools;
 #[path = "layer_panel.rs"]
 mod layer_panel;
+#[path = "skin_workflow.rs"]
+mod skin_workflow;
+#[path = "studio_layout.rs"]
+mod studio_layout;
+#[path = "transform_gizmo.rs"]
+mod transform_gizmo;
 use layer_panel::{LayerAction, LayerFilter};
 #[path = "app_chrome.rs"]
 mod app_chrome;
@@ -112,6 +122,8 @@ struct PhotoState {
     asset_cache_paths: Vec<PathBuf>,
     id: u64,
     photo: Photo,
+    source_photo: Photo,
+    source_seg: Option<Arc<Segmentation>>,
     edit: Edit,
     history: History,
     original_texture: egui::TextureHandle,
@@ -220,6 +232,12 @@ type MaskTexture = (
 );
 
 pub struct HasturApp {
+    face_focus: HashMap<u64, crate::focus::FocusReport>,
+    face_focus_errors: HashMap<u64, String>,
+    focus_run: Option<batch_workflow::FocusRun>,
+    focus_serial: u64,
+    sync_options: batch_workflow::SyncOptions,
+    skin_reference_face: usize,
     photos: Vec<PhotoState>,
     preview_history: VecDeque<PreviewSnapshot>,
     preview_history_bytes: usize,
@@ -244,6 +262,7 @@ pub struct HasturApp {
     compare: bool,
     split: f32,
     canvas_gesture: Gesture,
+    pan_drag: Option<interaction::PanDrag>,
     selection_anchor: usize,
     detail_region: Option<(u64, u64, engine::Crop, Arc<RgbaImage>)>,
     detail_region_generation: u64,
@@ -351,6 +370,13 @@ pub struct HasturApp {
     asset_loading: Option<(u64, u64, Arc<AtomicBool>)>,
     asset_serial: u64,
     asset_error: Option<u64>,
+    document_loading: Option<document_tools::PendingTransform>,
+    document_serial: u64,
+    document_error: Option<(u64, crate::image_transform::ImageTransform)>,
+    transform_draft: Option<transform_gizmo::TransformDraft>,
+    crop_preview: bool,
+    library_open: bool,
+    presets_visible: bool,
     gpu_release: bool,
     export_serial: u64,
     export_queue_open: bool,
@@ -416,11 +442,24 @@ fn apply_preview_texture(
 
 impl HasturApp {
     fn toggle_brush(&mut self, target: Target) {
+        self.transform_draft = None;
         self.patch_feedback.clear();
         self.end_canvas_gesture();
         self.brush = (self.brush != Some(target)).then_some(target);
         if self.brush.is_some_and(manual_tools::is_manual) {
             self.compare = false;
+            if matches!(
+                target,
+                Target::Clothing | Target::Dodge | Target::Burn | Target::StrayHair
+            ) {
+                self.show_mask = false;
+                self.erase = false;
+            }
+            if target == Target::StrayHair {
+                self.brush_radius = self.brush_radius.min(0.006);
+            } else if target == Target::Clothing {
+                self.brush_radius = self.brush_radius.max(0.03);
+            }
         }
         self.clone_pick_source = false;
         self.last_stroke = None;
@@ -532,6 +571,10 @@ impl HasturApp {
                 "clone" => Some(Target::Clone),
                 "patch" => Some(Target::Patch),
                 "mask" => Some(Target::LayerMask),
+                "clothing" => Some(Target::Clothing),
+                "hair" => Some(Target::StrayHair),
+                "dodge" => Some(Target::Dodge),
+                "burn" => Some(Target::Burn),
                 _ => None,
             });
         Self {
@@ -540,6 +583,19 @@ impl HasturApp {
             asset_loading: None,
             asset_serial: 0,
             asset_error: None,
+            document_loading: None,
+            document_serial: 0,
+            document_error: None,
+            transform_draft: None,
+            crop_preview: screenshot.is_some() && arguments.iter().any(|a| a == "--crop-preview"),
+            face_focus: HashMap::new(),
+            face_focus_errors: HashMap::new(),
+            focus_run: None,
+            focus_serial: 0,
+            sync_options: Default::default(),
+            skin_reference_face: 0,
+            library_open: false,
+            presets_visible: true,
             gpu_release: false,
             export_serial: 0,
             export_queue_open: false,
@@ -555,6 +611,7 @@ impl HasturApp {
                 .map(|name| match name.as_str() {
                     "presets" => Tool::Presets,
                     "color" => Tool::Color,
+                    "skin" => Tool::Skin,
                     "background" => Tool::Background,
                     "batch" => Tool::Batch,
                     "models" => Tool::Models,
@@ -578,6 +635,7 @@ impl HasturApp {
             compare: arguments.iter().any(|a| a == "--compare"),
             split: 0.5,
             canvas_gesture: Gesture::None,
+            pan_drag: None,
             selection_anchor: 0,
             detail_region: None,
             detail_region_generation: 0,
@@ -769,9 +827,6 @@ impl HasturApp {
         let Some(photo) = self.photos.get_mut(index) else {
             return;
         };
-        if !photo.photo.resident {
-            return;
-        }
         let same_provider = photo.ai_provider == Some(self.provider);
         let same_maps = photo.ai_seg_provider == Some(self.provider);
         let prepared = if same_maps && !force {
@@ -791,7 +846,7 @@ impl HasturApp {
             return;
         }
         let base = if same_maps && !force {
-            photo.seg.clone()
+            photo.canonical_seg().cloned()
         } else {
             None
         };
@@ -808,9 +863,8 @@ impl HasturApp {
         }
         let cancel = Arc::new(AtomicBool::new(false));
         photo.ai_cancel = Some(cancel.clone());
-        photo.ai_processing = self
-            .tx
-            .send(Job::Portrait {
+        let job = if photo.canonical_photo().resident {
+            Job::Portrait {
                 cancel,
                 id: photo.id,
                 request: photo.ai_request,
@@ -818,9 +872,21 @@ impl HasturApp {
                 provider: self.provider,
                 demand,
                 base,
-                image: photo.photo.preview.clone(),
-            })
-            .is_ok();
+                image: photo.canonical_photo().preview.clone(),
+            }
+        } else {
+            Job::PortraitSource {
+                cancel,
+                id: photo.id,
+                request: photo.ai_request,
+                force,
+                provider: self.provider,
+                demand,
+                base,
+                source: photo.canonical_photo().clone(),
+            }
+        };
+        photo.ai_processing = self.tx.send(job).is_ok();
         if !photo.ai_processing {
             photo.ai_failed = photo.ai_failed.union(missing);
             photo.note = Some("Portrait AI worker is unavailable; manual tools are ready".into());
@@ -832,6 +898,7 @@ impl HasturApp {
         self.last_stroke = None;
         self.clone_origin = None;
         self.canvas_gesture = Gesture::None;
+        self.pan_drag = None;
     }
 
     fn remember_preview(&mut self, snapshot: PreviewSnapshot) {
@@ -899,11 +966,24 @@ impl HasturApp {
         let Some(photo) = self.photos.get_mut(self.current) else {
             return;
         };
+        let old_transform = photo.edit.transform;
         for _ in target..past {
             photo.history.undo(&mut photo.edit);
         }
         for _ in past..target {
             photo.history.redo(&mut photo.edit);
+        }
+        if old_transform != photo.edit.transform {
+            photo.crop_center = crate::image_transform::remap_point(
+                photo.crop_center,
+                old_transform,
+                photo.edit.transform,
+                photo.canonical_photo().dimensions(),
+            );
+            photo.view = View::default();
+            self.clone_anchor = None;
+            self.clone_offset = None;
+            self.document_error = None;
         }
         self.patch_draft = PatchDraft::default();
         photo.revision += 1;
@@ -977,6 +1057,16 @@ impl HasturApp {
         }
         while let Ok(message) = self.rx.try_recv() {
             match message {
+                Message::FaceFocus {
+                    id,
+                    request,
+                    result,
+                } => self.accept_face_focus(id, request, result),
+                Message::FramePreview {
+                    id,
+                    revision,
+                    result,
+                } => self.accept_frame_preview(ctx, id, revision, result),
                 Message::AssetCaches { id, paths } => {
                     if let Some(photo) = self.photos.iter_mut().find(|p| p.id == id) {
                         photo.asset_cache_paths.extend(paths);
@@ -991,6 +1081,12 @@ impl HasturApp {
                     request,
                     result,
                 } => self.accept_asset(ctx, id, request, result),
+                Message::PhotoTransformed {
+                    id,
+                    request,
+                    transform,
+                    result,
+                } => self.accept_transform(ctx, id, request, transform, result),
                 Message::PatchPreview {
                     id,
                     revision,
@@ -1229,6 +1325,8 @@ impl HasturApp {
                                 asset_cache_paths: Vec::new(),
                                 id,
                                 edited: photo.preview.clone(),
+                                source_photo: photo.clone(),
+                                source_seg: segmentation.clone(),
                                 photo,
                                 edit,
                                 history,
@@ -1369,6 +1467,7 @@ impl HasturApp {
                         if let Some(p) = self.photos.iter_mut().find(|p| p.id == id) {
                             p.processing = None;
                             if p.photo.resident
+                                && p.document_ready()
                                 && Some(p.id) == current_photo_id
                                 && (p.revision == revision
                                     || (live_brush
@@ -1413,7 +1512,10 @@ impl HasturApp {
                     match result {
                         Ok(new) => {
                             if let Some(photo) = self.photos.iter_mut().find(|p| p.id == id) {
-                                let mut seg = photo.seg.as_deref().cloned().unwrap_or_default();
+                                let mut seg = photo
+                                    .canonical_seg()
+                                    .map(|s| (**s).clone())
+                                    .unwrap_or_default();
                                 if seg.width != new.width || seg.height != new.height {
                                     seg = seg.resample(new.width, new.height);
                                 }
@@ -1425,7 +1527,11 @@ impl HasturApp {
                                 } else {
                                     seg.background = new.background;
                                 }
-                                photo.seg = Some(Arc::new(seg));
+                                photo.seg = Some(Arc::new(seg.transformed(
+                                    photo.photo.applied_transform,
+                                    photo.canonical_photo().dimensions(),
+                                )));
+                                photo.source_seg = Some(Arc::new(seg));
                                 photo.revision += 1;
                             }
                             self.notify("Mask ready. Inspect edges and refine with the brush.");
@@ -1467,7 +1573,7 @@ impl HasturApp {
                         photo.ai_processing = !complete;
                         match result {
                             Ok(mut seg) => {
-                                if let Some(old) = &photo.seg {
+                                if let Some(old) = photo.canonical_seg() {
                                     let old = old.session_copy().resample(seg.width, seg.height);
                                     seg.background = old.background;
                                     if old.custom_skin {
@@ -1479,7 +1585,11 @@ impl HasturApp {
                                 }
                                 photo.note = Some(seg.status.clone());
                                 photo.ai_seg_provider = photo.ai_provider;
-                                photo.seg = Some(Arc::new(seg));
+                                photo.seg = Some(Arc::new(seg.transformed(
+                                    photo.photo.applied_transform,
+                                    photo.canonical_photo().dimensions(),
+                                )));
+                                photo.source_seg = Some(Arc::new(seg));
                                 photo.revision += 1;
                             }
                             Err(error) => {
@@ -1556,6 +1666,13 @@ impl HasturApp {
     }
 
     fn schedule_preview(&mut self, ctx: &egui::Context, live_brush: bool) {
+        if self
+            .photos
+            .get(self.current)
+            .is_some_and(|p| !p.document_ready())
+        {
+            return;
+        }
         let brush_dirty = self.photos.get(self.current).is_some_and(|photo| {
             self.brush_preview.is_some_and(|(id, _)| id == photo.id)
                 && photo.revision != photo.rendered_revision
@@ -1665,11 +1782,26 @@ impl HasturApp {
         let mut count = 0;
         for (index, photo) in self.photos.iter_mut().enumerate() {
             if index != self.current && photo.selected {
-                photo.history.record(photo.edit.clone());
-                photo.edit.settings = settings.clone();
-                photo.edit.preset = preset.clone();
-                photo.revision += 1;
-                count += 1;
+                let before = photo.edit.clone();
+                self.sync_options.apply(
+                    &settings,
+                    &mut photo.edit.settings,
+                    mean,
+                    photo.photo.analysis.mean,
+                );
+                if self.sync_options.portrait
+                    && self.sync_options.color
+                    && self.sync_options.background
+                {
+                    photo.edit.preset = preset.clone();
+                } else {
+                    photo.edit.preset = None;
+                }
+                if photo.edit != before {
+                    photo.history.record(before);
+                    photo.revision += 1;
+                    count += 1;
+                }
                 photo.note = if (photo.photo.analysis.mean - mean).abs() > 0.15 {
                     Some("Different exposure · review shadows and skin before export".into())
                 } else {
@@ -1680,6 +1812,7 @@ impl HasturApp {
         self.notify(format!(
             "Synced settings to {count} photos. Each photo keeps its own local masks."
         ));
+        self.queue_selected_portrait_ai();
     }
 
     fn session_snapshot(&self, clean_shutdown: bool) -> Session {
@@ -1700,7 +1833,7 @@ impl HasturApp {
                     history: p.history.clone(),
                     selected: p.selected,
                     rating: p.rating,
-                    segmentation: p.seg.as_deref().map(Segmentation::session_copy),
+                    segmentation: p.canonical_seg().map(|s| s.session_copy()),
                 })
                 .collect(),
         }
@@ -1869,11 +2002,11 @@ impl HasturApp {
 
     fn header(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("topbar")
-            .exact_height(52.0)
+            .exact_height(46.0)
             .frame(
                 egui::Frame::new()
                     .fill(PANEL)
-                    .inner_margin(egui::Margin::symmetric(12, 6))
+                    .inner_margin(egui::Margin::symmetric(8, 4))
                     .stroke(Line::new(1.0_f32, BORDER)),
             )
             .show(ctx, |ui| {
@@ -1881,10 +2014,7 @@ impl HasturApp {
                     let (r, _) = ui.allocate_exact_size(vec2(26.0, 28.0), Sense::hover());
                     branding::paint_logo(ui.painter(), r, branding::IVORY);
                     ui.add_space(6.0);
-                    ui.label(RichText::new("hastur").size(23.0).strong().color(TEXT));
-                    if ctx.content_rect().width() >= 720.0 {
-                        ui.label(RichText::new("RETOUCH").size(10.0).color(MUTED));
-                    }
+                    ui.label(RichText::new("hastur").size(18.0).strong().color(TEXT));
                     ui.add_space(6.0);
                     ui.menu_button(RichText::new("File").color(MUTED), |ui| {
                         if ui
@@ -1977,6 +2107,7 @@ impl HasturApp {
                             ui.close();
                         }
                     });
+                    self.image_menu(ui);
                     let view_menu = ui.menu_button(RichText::new("View").color(MUTED), |ui| {
                         for panel in [Inspector::Tools, Inspector::History, Inspector::Layers] {
                             let response = ui.add(
@@ -2024,6 +2155,14 @@ impl HasturApp {
                             ui.close();
                         }
                         ui.separator();
+                        let r = ui.add(
+                            egui::Button::new("Preset sidebar").selected(self.presets_visible),
+                        );
+                        hit(ui, "view-presets", r.rect);
+                        if r.clicked() {
+                            self.presets_visible = !self.presets_visible;
+                            ui.close();
+                        }
                         if ui.button("Hide panels  ·  Tab").clicked() {
                             self.inspector = None;
                             self.compact_open = false;
@@ -2087,26 +2226,25 @@ impl HasturApp {
                     {
                         self.redo(ui.ctx());
                     }
-                    let name = self
-                        .photos
-                        .get(self.current)
-                        .map(|p| p.photo.name.as_str())
-                        .unwrap_or("Your next great portrait");
-                    if ctx.content_rect().width() >= 1360.0 {
-                        ui.add_space(12.0);
-                        ui.label(RichText::new(name).size(12.0).color(MUTED));
-                    }
+                    self.workspace_toolbar(ui);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if layer_panel::icon_button(
-                            ui,
+                        let r = ui.add_enabled(
+                            !self.photos.is_empty() && self.transform_draft.is_none(),
+                            primary("      Export")
+                                .min_size(vec2(98., 32.))
+                                .corner_radius(16),
+                        );
+                        hit(ui, "toolbar-export", r.rect);
+                        layer_panel::paint_icon(
+                            ui.painter(),
+                            Rect::from_center_size(
+                                pos2(r.rect.left() + 16., r.rect.center().y),
+                                vec2(18., 18.),
+                            ),
                             layer_panel::Icon::Export,
-                            true,
-                            !self.photos.is_empty(),
-                            "toolbar-export",
-                            "Export photos",
-                        )
-                        .clicked()
-                        {
+                            BG,
+                        );
+                        if r.clicked() {
                             self.export_open = true;
                         }
                         if ctx.content_rect().width() >= 1050.0 {
@@ -2202,20 +2340,20 @@ impl HasturApp {
                 });
             return;
         }
-        egui::SidePanel::left("rail")
-            .exact_width(64.0)
+        egui::SidePanel::right("rail")
+            .exact_width(52.0)
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::symmetric(6, 10))
+                    .fill(BG)
+                    .inner_margin(egui::Margin::symmetric(4, 6))
                     .stroke(Line::new(1.0_f32, BORDER)),
             )
             .show(ctx, |ui| {
                 if rail_button(ui, None, false, "Import photos · Ctrl+O").clicked() {
                     self.import();
                 }
-                ui.add_space(12.0);
+                ui.add_space(6.0);
                 for tool in [
                     Tool::Portrait,
                     Tool::Skin,
@@ -2257,7 +2395,9 @@ impl HasturApp {
     }
 
     fn tools(&mut self, ctx: &egui::Context) {
-        if self.inspector.is_none() {
+        if self.inspector.is_none()
+            || (self.transform_draft.is_some() && self.inspector == Some(Inspector::Tools))
+        {
             return;
         }
         if ctx.content_rect().width() < 1050.0 {
@@ -2292,7 +2432,7 @@ impl HasturApp {
             .frame(
                 egui::Frame::new()
                     .fill(PANEL)
-                    .inner_margin(egui::Margin::symmetric(14, 12))
+                    .inner_margin(egui::Margin::symmetric(12, 8))
                     .stroke(Line::new(1.0_f32, BORDER)),
             )
             .show(ctx, |ui| {
@@ -2479,9 +2619,19 @@ impl HasturApp {
     }
 
     fn controls_content(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().button_padding = vec2(8., 4.);
         let tool = self.tool;
         let ctx = ui.ctx().clone();
-        ui.label(RichText::new(tool.title()).size(20.0).strong());
+        ui.label(
+            RichText::new(if tool == Tool::Portrait {
+                "Portrait retouching"
+            } else {
+                tool.title()
+            })
+            .size(16.0)
+            .strong(),
+        )
+        .on_hover_text(tool.description());
         if let Some(layer) = self
             .photos
             .get(self.current)
@@ -2493,9 +2643,7 @@ impl HasturApp {
                     .color(YELLOW),
             );
         }
-        ui.add_space(5.0);
-        ui.label(RichText::new(tool.description()).size(11.0).color(MUTED));
-        ui.add_space(10.0);
+        ui.add_space(6.0);
         ui.spacing_mut().scroll.floating = false;
         egui::ScrollArea::vertical()
             .id_salt("tool-scroll")
@@ -2527,15 +2675,6 @@ impl HasturApp {
                     self.gesture = ctx.input(|i| i.pointer.any_down());
                     self.edited();
                 }
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.label(RichText::new("NATURAL BY DESIGN").size(9.0).color(MUTED));
-                ui.label(
-                    RichText::new("Your features. Your texture. Your story.")
-                        .size(11.0)
-                        .color(MUTED),
-                );
             });
     }
 
@@ -2552,7 +2691,7 @@ impl HasturApp {
         );
         ui.add_space(10.0);
         let auto = ui
-            .add_sized([ui.available_width(), 42.0], primary("✧  Auto Retouch"))
+            .add_sized([ui.available_width(), 36.0], primary("✧  Auto Retouch"))
             .on_hover_text("Clean up facial skin and wrinkles while keeping your color, contrast and shape settings.");
         hit(ui, "auto-retouch", auto.rect);
         if auto.clicked() {
@@ -2565,7 +2704,7 @@ impl HasturApp {
                 .size(10.0)
                 .color(MUTED),
         );
-        ui.add_space(24.0);
+        ui.add_space(8.0);
         section(ui, "MANUAL CLEANUP", |ui| {
             ui.horizontal_wrapped(|ui| {
                 for target in [Target::Liquify, Target::Heal, Target::Clone, Target::Patch] {
@@ -2588,14 +2727,35 @@ impl HasturApp {
                     }
                 }
             });
+            let hair = small_chip(ui, "Stray hair", self.brush == Some(Target::StrayHair));
+            hit(ui, "tool-Stray hair", hair.rect);
+            if hair.clicked() {
+                self.toggle_brush(Target::StrayHair);
+            }
+            let r = small_chip(
+                ui,
+                "Clothing wrinkles",
+                self.brush == Some(Target::Clothing),
+            );
+            hit(ui, "tool-Clothing wrinkles", r.rect);
+            if r.clicked() {
+                self.toggle_brush(Target::Clothing);
+            }
+            if self.brush == Some(Target::Clothing) {
+                adjustment(
+                    ui,
+                    "Crease reduction",
+                    &mut self.photos[self.current].edit.settings,
+                    Adjustment::ClothingWrinkles,
+                    0.0..=100.0,
+                    "Paint fabric creases. Retains fine weave and broad drape; avoid seams and printed patterns.",
+                );
+            }
         });
-        if matches!(
-            self.brush,
-            Some(Target::Heal | Target::Liquify | Target::Clone | Target::Patch)
-        ) {
+        if self.brush.is_some_and(manual_tools::is_manual) {
             self.brush_controls(ui);
         }
-        ui.add_space(20.0);
+        ui.add_space(8.0);
         section(ui, "SKIN", |ui| {
             let settings = &mut self.photos[self.current].edit.settings;
             adjustment(
@@ -2632,27 +2792,7 @@ impl HasturApp {
                 }
             });
         });
-        ui.add_space(20.0);
-        section(ui, "FLYAWAY HAIR", |ui| {
-            adjustment(
-                ui,
-                "Flyaway cleanup",
-                &mut self.photos[self.current].edit.settings,
-                Adjustment::FlyawayHairs,
-                0.0..=100.0,
-                "Repair fine isolated strands outside the detected face. Broad hair locks and facial edges are protected. Textured backgrounds may need Spot heal or Patch.",
-            );
-            if self.photos[self.current]
-                .seg
-                .as_ref()
-                .is_none_or(|s| s.faces.is_empty())
-            {
-                ui.label(
-                    RichText::new("Detect a face first to locate the hair region.").color(MUTED),
-                );
-            }
-        });
-        ui.add_space(20.0);
+        ui.add_space(8.0);
         section(ui, "FACE DETAILS", |ui| {
             let settings = &mut self.photos[self.current].edit.settings;
             adjustment(
@@ -2711,7 +2851,27 @@ impl HasturApp {
                 .color(MUTED),
             );
         });
-        ui.add_space(20.0);
+        ui.add_space(8.0);
+        section(ui, "FLYAWAY HAIR", |ui| {
+            adjustment(
+                ui,
+                "Flyaway cleanup",
+                &mut self.photos[self.current].edit.settings,
+                Adjustment::FlyawayHairs,
+                0.0..=100.0,
+                "Repair fine isolated strands outside the detected face. Broad hair locks and facial edges are protected. Textured backgrounds may need Spot heal or Patch.",
+            );
+            if self.photos[self.current]
+                .seg
+                .as_ref()
+                .is_none_or(|s| s.faces.is_empty())
+            {
+                ui.label(
+                    RichText::new("Detect a face first to locate the hair region.").color(MUTED),
+                );
+            }
+        });
+        ui.add_space(12.0);
         egui::CollapsingHeader::new("FACE SHAPE & SCULPTING")
             .default_open(false)
             .show(ui, |ui| {
@@ -2765,8 +2925,8 @@ impl HasturApp {
                     "Brighten cheekbones, the nose bridge and forehead using landmarks.",
                 );
             });
-        ui.add_space(20.0);
-        ui.add_space(20.0);
+        ui.add_space(8.0);
+        ui.add_space(8.0);
         section(ui, "FINISH", |ui| {
             adjustment(
                 ui,
@@ -2777,10 +2937,7 @@ impl HasturApp {
                 "Subtle high-pass sharpening in linear light.",
             );
         });
-        if !matches!(
-            self.brush,
-            Some(Target::Heal | Target::Liquify | Target::Clone | Target::Patch)
-        ) {
+        if !self.brush.is_some_and(manual_tools::is_manual) {
             self.brush_controls(ui);
         }
         ui.add_space(18.0);
@@ -2795,6 +2952,8 @@ impl HasturApp {
     }
 
     fn skin_panel(&mut self, ui: &mut egui::Ui) {
+        self.skin_reference_panel(ui);
+        ui.add_space(12.);
         section(ui, "TONE & TEXTURE", |ui| {
             let settings = &mut self.photos[self.current].edit.settings;
             adjustment(
@@ -2823,6 +2982,16 @@ impl HasturApp {
             );
         });
         ui.add_space(20.0);
+        slider(
+            ui,
+            "Keep skin detail",
+            &mut self.photos[self.current]
+                .edit
+                .settings
+                .skin_detail_retention,
+            0.0..=100.0,
+            "Preserve fine pores while reducing larger uneven texture. Higher values keep more detail.",
+        );
         if ui
             .add_sized([ui.available_width(), 36.0], secondary("Refine skin mask"))
             .clicked()
@@ -2873,6 +3042,22 @@ impl HasturApp {
                 Adjustment::Shadows,
                 -100.0..=100.0,
                 "Lift or deepen dark tones.",
+            );
+            adjustment(
+                ui,
+                "Whites",
+                s,
+                Adjustment::Whites,
+                -100.0..=100.0,
+                "Adjust the brightest tones while preserving midtones.",
+            );
+            adjustment(
+                ui,
+                "Blacks",
+                s,
+                Adjustment::Blacks,
+                -100.0..=100.0,
+                "Lift or deepen the darkest tones while preserving highlights.",
             );
         });
         ui.add_space(20.0);
@@ -2927,6 +3112,29 @@ impl HasturApp {
         self.curves_panel(ui);
         ui.add_space(20.0);
         self.reference_panel(ui);
+        ui.add_space(16.);
+        section(ui, "LOCAL LIGHT", |ui| {
+            adjustment(
+                ui,
+                "Brush light · EV",
+                &mut self.photos[self.current].edit.settings,
+                Adjustment::DodgeBurn,
+                0.0..=2.0,
+                "Lighten or darken painted areas without changing color balance.",
+            );
+            ui.horizontal(|ui| {
+                for target in [Target::Dodge, Target::Burn] {
+                    let r = small_chip(ui, target.label(), self.brush == Some(target));
+                    hit(ui, &format!("tool-{}", target.label()), r.rect);
+                    if r.clicked() {
+                        self.toggle_brush(target);
+                    }
+                }
+            });
+        });
+        if matches!(self.brush, Some(Target::Dodge | Target::Burn)) {
+            self.brush_controls(ui);
+        }
     }
 
     fn hsl_panel(&mut self, ui: &mut egui::Ui) {
@@ -3288,9 +3496,22 @@ impl HasturApp {
     fn preset_panel(&mut self, ui: &mut egui::Ui) {
         let p = &self.photos[self.current];
         let key = (p.id, p.revision, self.presets.len());
-        if self.preset_key != Some(key) {
+        let new_gallery = self
+            .preset_key
+            .is_none_or(|old| old.0 != key.0 || old.2 != key.2);
+        let idle = !ui.input(|i| i.pointer.any_down())
+            && self.canvas_gesture != Gesture::Brush
+            && p.rendered_revision == p.revision
+            && self.last_edit.elapsed() >= Duration::from_millis(200);
+        if p.photo.resident
+            && p.document_ready()
+            && (new_gallery || idle)
+            && self.preset_key != Some(key)
+        {
             self.preset_key = Some(key);
-            self.preset_thumbs = vec![None; self.presets.len()];
+            if new_gallery {
+                self.preset_thumbs = vec![None; self.presets.len()];
+            }
             let _ = self.tx.send(Job::Presets {
                 id: p.id,
                 revision: p.revision,
@@ -3301,70 +3522,87 @@ impl HasturApp {
             });
         }
         let mut choose = None;
-        for (index, preset) in self.presets.iter().enumerate() {
-            let selected =
-                self.photos[self.current].edit.preset.as_deref() == Some(preset.name.as_str());
-            let (rect, response) =
-                ui.allocate_exact_size(vec2(ui.available_width(), 76.0), Sense::click());
-            ui.painter().rect_filled(
-                rect,
-                12.0,
-                if selected {
-                    Color32::from_rgb(40, 37, 23)
-                } else {
-                    RAISED
-                },
-            );
-            ui.painter().rect_stroke(
-                rect,
-                12.0,
-                Line::new(1.0_f32, if selected { YELLOW } else { BORDER }),
-                egui::StrokeKind::Inside,
-            );
-            let thumb = Rect::from_min_size(rect.min + vec2(8.0, 8.0), vec2(48.0, 60.0));
-            if let Some(Some(tex)) = self.preset_thumbs.get(index) {
-                ui.painter().image(
-                    tex.id(),
-                    thumb,
-                    Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-            } else {
-                ui.painter().text(
-                    thumb.center(),
-                    Align2::CENTER_CENTER,
-                    "…",
-                    FontId::proportional(18.0),
-                    MUTED,
-                );
-            }
-            hit(ui, &format!("preset-{index}"), rect);
-            if response.hovered() {
-                self.hover_preset = Some(index);
-            }
-            ui.painter().text(
-                rect.min + vec2(70.0, 22.0),
-                Align2::LEFT_CENTER,
-                &preset.name,
-                FontId::proportional(12.0),
-                TEXT,
-            );
-            ui.painter().text(
-                rect.min + vec2(70.0, 45.0),
-                Align2::LEFT_CENTER,
-                &preset.description,
-                FontId::proportional(10.0),
-                MUTED,
-            );
-            if selected {
-                ui.painter()
-                    .circle_filled(rect.right_top() + vec2(-12.0, 12.0), 3.0, YELLOW);
-            }
-            if response.clicked() {
-                choose = Some(index);
-            }
-            ui.add_space(10.0);
-        }
+        let columns = if ui.available_width() >= 180. { 2 } else { 1 };
+        let width = (ui.available_width() - (columns - 1) as f32 * 8.) / columns as f32;
+        egui::Grid::new("preset-card-grid")
+            .num_columns(columns)
+            .spacing(vec2(8., 8.))
+            .show(ui, |ui| {
+                for (index, preset) in self.presets.iter().enumerate() {
+                    let selected = self.photos[self.current].edit.preset.as_deref()
+                        == Some(preset.name.as_str());
+                    let (rect, response) =
+                        ui.allocate_exact_size(vec2(width, width * 1.25), Sense::click());
+                    ui.painter().rect_filled(
+                        rect,
+                        5.0,
+                        if selected {
+                            Color32::from_rgb(40, 37, 23)
+                        } else {
+                            RAISED
+                        },
+                    );
+                    ui.painter().rect_stroke(
+                        rect,
+                        5.0,
+                        Line::new(1.0_f32, if selected { YELLOW } else { BORDER }),
+                        egui::StrokeKind::Inside,
+                    );
+                    let thumb = rect.shrink(2.);
+                    if let Some(Some(tex)) = self.preset_thumbs.get(index) {
+                        let size = tex.size_vec2();
+                        let fill = (thumb.width() / size.x).max(thumb.height() / size.y);
+                        let uv_size = thumb.size() / (size * fill);
+                        ui.painter().image(
+                            tex.id(),
+                            thumb,
+                            Rect::from_center_size(pos2(0.5, 0.5), uv_size),
+                            Color32::WHITE,
+                        );
+                    } else {
+                        ui.painter().text(
+                            thumb.center(),
+                            Align2::CENTER_CENTER,
+                            "…",
+                            FontId::proportional(18.0),
+                            MUTED,
+                        );
+                    }
+                    hit(ui, &format!("preset-{index}"), rect);
+                    if response.hovered() {
+                        self.hover_preset = Some(index);
+                    }
+                    ui.painter().rect_filled(
+                        Rect::from_min_max(
+                            pos2(rect.left() + 2., rect.bottom() - 27.),
+                            rect.right_bottom() - vec2(2., 2.),
+                        ),
+                        3.,
+                        Color32::from_black_alpha(155),
+                    );
+                    ui.painter().with_clip_rect(rect.shrink(5.)).text(
+                        rect.left_bottom() + vec2(7., -14.),
+                        Align2::LEFT_CENTER,
+                        &preset.name,
+                        FontId::proportional(11.0),
+                        TEXT,
+                    );
+                    if selected {
+                        ui.painter().circle_filled(
+                            rect.right_top() + vec2(-12.0, 12.0),
+                            3.0,
+                            YELLOW,
+                        );
+                    }
+                    if response.clicked() {
+                        choose = Some(index);
+                    }
+                    response.on_hover_text(&preset.description);
+                    if (index + 1) % columns == 0 {
+                        ui.end_row();
+                    }
+                }
+            });
         if let Some(index) = choose {
             self.photos[self.current].edit.settings = self.presets[index].settings.clone();
             self.photos[self.current].edit.preset = Some(self.presets[index].name.clone());
@@ -3449,12 +3687,15 @@ impl HasturApp {
             }
         });
         ui.add_space(18.0);
+        self.batch_sync_options(ui);
         if ui
             .add_enabled(
-                self.photos
-                    .iter()
-                    .enumerate()
-                    .any(|(i, p)| i != self.current && p.selected),
+                self.sync_options.active()
+                    && self
+                        .photos
+                        .iter()
+                        .enumerate()
+                        .any(|(i, p)| i != self.current && p.selected),
                 primary("Sync settings to selected").min_size(vec2(ui.available_width(), 40.0)),
             )
             .clicked()
@@ -3470,6 +3711,8 @@ impl HasturApp {
             .color(MUTED),
         );
         ui.add_space(24.0);
+        self.focus_review_panel(ui);
+        ui.add_space(16.0);
         if ui
             .add_sized(
                 [ui.available_width(), 34.0],
@@ -3646,7 +3889,7 @@ impl HasturApp {
                 path,
                 kind: self.model_kind,
                 provider: self.provider,
-                image: p.photo.preview.clone(),
+                image: p.canonical_photo().preview.clone(),
             });
         }
         ui.add_space(26.0);
@@ -3689,6 +3932,14 @@ impl HasturApp {
                         }
                     });
                     if target == Target::Patch {
+                        let short = self.photos[self.current].photo.dimensions().0.min(self.photos[self.current].photo.dimensions().1) as f32;
+                        let mut pixels = self.brush_radius * short;
+                        ui.horizontal(|ui| {
+                            ui.label("Feather width");
+                            let size = ui.add(egui::DragValue::new(&mut pixels).range(1.0..=short*0.15).speed(1.).suffix(" px"));
+                            hit(ui,"patch-feather-width",size.rect);
+                            if size.changed() { self.brush_radius = pixels / short; }
+                        }).response.on_hover_text("−/+ changes the patch feather width. Softness scales this width.");
                         let mut softness = self.brush_softness * 100.0;
                         slider(
                             ui,
@@ -3725,7 +3976,7 @@ impl HasturApp {
                         );
                         self.brush_softness = softness / 100.0;
                     }
-                    if matches!(target, Target::Heal | Target::Liquify | Target::Clone | Target::LayerMask) {
+                    if matches!(target, Target::Heal | Target::Liquify | Target::Clone | Target::LayerMask | Target::Clothing | Target::Dodge | Target::Burn | Target::StrayHair) {
                         slider(
                             ui,
                             "Brush strength",
@@ -3796,6 +4047,12 @@ impl HasturApp {
                             "Paint black to hide this layer, or enable Reveal to restore it. Space + drag to pan."
                         } else if target == Target::Liquify {
                             "Drag to push or pull. Space + drag to pan."
+                        } else if target == Target::Clothing {
+                            "Use a brush wider than the crease and trace along it. Avoid seams and printed patterns. −/+ changes size; X erases; Space pans."
+                        } else if target == Target::StrayHair {
+                            "Cover the strand with the brush and trace along it. Increase size for thicker hairs. Keep clear of brows and eyes. −/+ changes size; Space pans."
+                        } else if matches!(target,Target::Dodge | Target::Burn) {
+                            "Paint local light. −/+ changes size; X erases; Space pans."
                         } else {
                             "Paint on the photo. Space + drag to pan."
                         })
@@ -3813,7 +4070,7 @@ impl HasturApp {
         let photo_focus = self.photo_focus;
         self.photo_focus = false;
         egui::TopBottomPanel::bottom("filmstrip")
-            .exact_height(128.0)
+            .exact_height(120.0)
             .frame(
                 egui::Frame::new()
                     .fill(PANEL)
@@ -3822,8 +4079,9 @@ impl HasturApp {
             )
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 4.0;
+                hit(ui, "filmstrip-content", ui.max_rect());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("YOUR SESSION").size(9.0).color(MUTED));
+                    ui.label(RichText::new("Library").size(11.0).color(TEXT));
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(format!("{} photos", self.photos.len()))
@@ -3831,17 +4089,20 @@ impl HasturApp {
                             .color(MUTED),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.zoom_controls(ui);
                         if small_chip(ui, "Sync settings", false)
                             .on_hover_text("Copy current adjustments to selected photos")
                             .clicked()
                         {
                             self.sync();
                         }
-                        ui.label(
-                            RichText::new("Ctrl / Shift + click to select")
-                                .size(10.0)
-                                .color(MUTED),
-                        );
+                        if ctx.content_rect().width() >= 1280. {
+                            ui.label(
+                                RichText::new("Ctrl / Shift + click to select")
+                                    .size(10.0)
+                                    .color(MUTED),
+                            );
+                        }
                     });
                 });
                 ui.add_space(4.0);
@@ -3995,17 +4256,21 @@ impl HasturApp {
             .frame(
                 egui::Frame::new()
                     .fill(BG)
-                    .inner_margin(egui::Margin::symmetric(12, 10)),
+                    .inner_margin(egui::Margin::symmetric(4, 2)),
             )
             .show(ctx, |ui| {
                 hit(ui, "canvas-content", ui.max_rect());
-                ui.horizontal(|ui| {
+                if self.transform_draft.is_some() {
+                    self.transform_bar(ui);
+                } else { ui.horizontal(|ui| {
                     if self.brush == Some(Target::LayerMask) && !self.photos.is_empty() {
                         ui.allocate_ui_with_layout(vec2((ui.available_width()-130.).max(160.),34.), egui::Layout::left_to_right(egui::Align::Center), |ui| self.mask_workspace_bar(ui));
                     } else if self.brush.is_some_and(manual_tools::is_manual) && !self.photos.is_empty() {
                         ui.allocate_ui_with_layout(vec2((ui.available_width()-130.).max(160.),34.), egui::Layout::left_to_right(egui::Align::Center), |ui| self.manual_workspace_bar(ui));
                     } else {
-                        ui.label(RichText::new("PORTRAIT WORKSPACE").size(10.0).color(MUTED));
+                        if let Some(p) = self.photos.get(self.current) {
+                            ui.label(RichText::new(&p.photo.name).size(11.0).color(MUTED));
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if small_chip(ui, "Before / After", self.compare).clicked() {
@@ -4019,12 +4284,12 @@ impl HasturApp {
                             ui.label(RichText::new("GENERATED DEMO").size(9.0).color(MUTED));
                         }
                     });
-                });
-                ui.add_space(6.0);
+                }); }
+                ui.add_space(2.0);
                 let (viewport, _) = ui.allocate_exact_size(
                     vec2(
                         ui.available_width(),
-                        (ui.available_height() - 46.0).max(1.0),
+                        (ui.available_height() - if self.filmstrip_visible { 2. } else { 46. }).max(1.0),
                     ),
                     Sense::hover(),
                 );
@@ -4057,19 +4322,28 @@ impl HasturApp {
                 let mut rect = self.photos[self.current]
                     .view
                     .layout(viewport, dimensions, dpi);
-                if !self.photos[self.current].photo.resident {
+                if !self.photos[self.current].photo.resident || !self.photos[self.current].document_ready() {
                     let photo = &self.photos[self.current];
                     let (w,h)=photo.photo.dimensions();
                     let rect=Rect::from_center_size(viewport.center(),vec2(w as f32,h as f32)*
                         (viewport.width()/w as f32).min(viewport.height()/h as f32));
                     ui.painter().image(photo.edited_texture.id(),rect,Rect::from_min_max(Pos2::ZERO,pos2(1.,1.)),Color32::WHITE);
-                    if self.asset_error==Some(photo.id) {
+                    if self.document_error == Some((photo.id, photo.edit.transform)) {
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_center_size(viewport.center(),vec2(230.,40.))),|ui|{
+                            if ui.button("Retry image preparation").clicked() { self.document_error=None; }
+                        });
+                    } else if self.asset_error==Some(photo.id) {
                         ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_center_size(viewport.center(),vec2(230.,40.))),|ui|{
                             if ui.button("Retry opening original").clicked() {self.asset_error=None;}
                         });
                     } else {
-                        ui.painter().text(viewport.center_bottom()-vec2(0.,24.),Align2::CENTER_BOTTOM,"Opening original for editing…",FontId::proportional(14.),YELLOW);
+                        let label = if photo.document_ready() { "Opening original for editing…" } else { "Preparing document geometry…" };
+                        ui.painter().text(viewport.center_bottom()-vec2(0.,24.),Align2::CENTER_BOTTOM,label,FontId::proportional(14.),YELLOW);
                     }
+                    return;
+                }
+                if self.transform_canvas(ui, viewport, rect) {
+                    self.canvas_zoom_bar(ui, dimensions);
                     return;
                 }
                 let response = ui.interact(
@@ -4088,11 +4362,11 @@ impl HasturApp {
                         _ => None,
                     })));
                 if space
-                    && response.dragged()
                     && ctx.input(|i| i.pointer.primary_down())
                     && self.canvas_gesture == Gesture::Brush
                 {
                     self.canvas_gesture = Gesture::Pan;
+                    self.pan_drag = pointer.map(|pos| interaction::PanDrag::new(pos-ctx.input(|i|i.pointer.delta()),self.photos[self.current].view.pan));
                     self.last_stroke = None;
                     self.clone_origin = None;
                     if self.brush == Some(Target::Patch) {
@@ -4101,7 +4375,7 @@ impl HasturApp {
                     }
                 }
                 if response.hovered() || response.dragged() {
-                    if space && self.canvas_gesture != Gesture::Divider {
+                    if (space || self.brush.is_none() || self.canvas_gesture == Gesture::Pan) && self.canvas_gesture != Gesture::Divider {
                         ctx.set_cursor_icon(if ctx.input(|i| i.pointer.primary_down()) {
                             egui::CursorIcon::Grabbing
                         } else {
@@ -4125,6 +4399,7 @@ impl HasturApp {
                         self.brush.is_some(),
                         space,
                     );
+                    self.pan_drag = (self.canvas_gesture == Gesture::Pan).then(|| interaction::PanDrag::new(pos,self.photos[self.current].view.pan));
                     if self.canvas_gesture == Gesture::Brush && self.brush == Some(Target::Clone)
                         && (self.clone_pick_source || ctx.input(|i| i.modifiers.alt)) {
                         self.canvas_gesture = Gesture::Source;
@@ -4165,6 +4440,9 @@ impl HasturApp {
                     } else {
                         *view = View::default();
                     }
+                    // A stationary second click changes the camera. Its earlier
+                    // pan capture must not overwrite the newly selected view.
+                    self.end_canvas_gesture();
                 }
                 if response.hovered() && self.canvas_gesture == Gesture::None {
                     let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
@@ -4193,7 +4471,7 @@ impl HasturApp {
                 {
                     self.reject_manual_stroke();
                 }
-                if ctx.input(|i| i.pointer.primary_down() || i.pointer.primary_pressed()) {
+                if ctx.input(|i| i.pointer.primary_down() || i.pointer.primary_pressed() || (self.canvas_gesture == Gesture::Pan && i.pointer.primary_released())) {
                     match self.canvas_gesture {
                         Gesture::Source => {
                             if ctx.input(|i| i.pointer.primary_pressed()) && let Some(pos) = press_origin.or(pointer) {
@@ -4206,12 +4484,10 @@ impl HasturApp {
                             }
                         }
                         Gesture::Pan => {
-                            let delta = ctx.input(|i| i.pointer.delta());
-                            let view = &mut self.photos[self.current].view;
-                            if response.dragged() {
-                                view.fit = false;
-                                view.pan[0] += delta.x;
-                                view.pan[1] += delta.y;
+                            if let (Some(drag),Some(pos))=(self.pan_drag,pointer) {
+                                let view=&mut self.photos[self.current].view;
+                                let pan=drag.position(pos);
+                                if pan!=view.pan {view.fit=false;view.pan=pan;}
                             }
                         }
                         Gesture::Divider => {
@@ -4391,7 +4667,7 @@ impl HasturApp {
                                                         radius: self.brush_radius,
                                                         softness: self.brush_softness,
                                                         erase: self.erase && target != Target::Heal,
-                                                        strength: if target == Target::Heal { self.brush_strength } else { 100.0 },
+                                                        strength: if manual_tools::is_manual(target) { self.brush_strength } else { 100.0 },
                                                     });
                                                 }
                                             }
@@ -4456,6 +4732,7 @@ impl HasturApp {
                             let source_end = mapping.source(end);
                             p.history.record(p.edit.clone());
                             let patch = crate::cleanup::PatchStroke {
+                                feather: Some(self.brush_radius),
                                 boundary,
                                 offset: [
                                     source_end[0] - source_start[0],
@@ -4475,6 +4752,23 @@ impl HasturApp {
                     .view
                     .layout(viewport, dimensions, dpi);
                 hit(ui, "image", rect);
+                if !rect.intersects(viewport) {
+                    // The camera may move wholly into empty canvas. Keep accepting
+                    // pan input, but do not render an offscreen tile or GPU callback.
+                    if let Some(cancel) = self.detail_cancel.take() {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                    self.detail_region_pending = None;
+                    ui.painter().text(
+                        viewport.center(),
+                        Align2::CENTER_CENTER,
+                        "Image outside view · 0 / Fit to return",
+                        FontId::proportional(14.),
+                        MUTED,
+                    );
+                    self.canvas_zoom_bar(ui, dimensions);
+                    return;
+                }
                 let p = &self.photos[self.current];
                 let native = needs_detail_resolution(&p.photo, p.view.scale);
                 let live_brush = self.canvas_gesture == Gesture::Brush
@@ -4694,16 +4988,7 @@ impl HasturApp {
                         {
                             tile.original.clone()
                         } else {
-                            Arc::new(
-                                image::imageops::crop_imm(
-                                    &*p.photo.original,
-                                    x,
-                                    y,
-                                    crop.width,
-                                    crop.height,
-                                )
-                                .to_image(),
-                            )
+                            Arc::new(crate::pixel_region::crop(&p.photo.original,crop))
                         };
                         let after = if hover.is_none()
                             && let Some((_, _, source_crop, source)) = region
@@ -4716,28 +5001,12 @@ impl HasturApp {
                                 // use the sharp original until the new edited tile arrives.
                                 let overlap = intersect_crop(crop, source_crop);
                                 if overlap.width != 0 && overlap.height != 0 {
-                                    let part = image::imageops::crop_imm(
-                                        source.as_ref(),
-                                        overlap.x - source_crop.x,
-                                        overlap.y - source_crop.y,
-                                        overlap.width,
-                                        overlap.height,
-                                    )
-                                    .to_image();
-                                    image::imageops::replace(
-                                        &mut after,
-                                        &part,
-                                        (overlap.x - crop.x) as i64,
-                                        (overlap.y - crop.y) as i64,
-                                    );
+                                    crate::pixel_region::copy_into(source,engine::Crop{x:overlap.x-source_crop.x,y:overlap.y-source_crop.y,width:overlap.width,height:overlap.height},&mut after,[overlap.x-crop.x,overlap.y-crop.y]);
                                 }
                                 Arc::new(after)
                             }
                         } else {
-                            Arc::new(
-                                image::imageops::crop_imm(&*full, x, y, crop.width, crop.height)
-                                    .to_image(),
-                            )
+                            Arc::new(crate::pixel_region::crop(&full,crop))
                         };
                         self.tile_serial += 1;
                         let original_texture = if let Some(tile) = &self.detail_tile
@@ -5046,51 +5315,7 @@ impl HasturApp {
                         YELLOW,
                     );
                 }
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "{} × {}  ·  sRGB",
-                            dimensions.x as u32, dimensions.y as u32
-                        ))
-                        .size(10.0)
-                        .color(MUTED),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let view = &mut self.photos[self.current].view;
-                        let fit = small_chip(ui, "Fit", view.fit);
-                        hit(ui, "fit", fit.rect);
-                        if fit.clicked() {
-                            *view = View::default();
-                        }
-                        let native =
-                            small_chip(ui, "100%", !view.fit && (view.scale - 1.0).abs() < 0.001);
-                        hit(ui, "native", native.rect);
-                        if native
-                            .on_hover_text("One original pixel per screen pixel")
-                            .clicked()
-                        {
-                            view.scale = 1.0;
-                            view.fit = false;
-                            view.pan = [0.0; 2];
-                        }
-                        let plus = small_chip(ui, "+", false);
-                        hit(ui, "zoom-plus", plus.rect);
-                        if plus.clicked() {
-                            view.zoom_at(view.scale * 1.2, viewport.center(), viewport);
-                        }
-                        ui.label(
-                            RichText::new(format!("{:.1}%", view.scale * 100.0))
-                                .size(11.0)
-                                .color(TEXT),
-                        );
-                        let minus = small_chip(ui, "−", false);
-                        hit(ui, "zoom-minus", minus.rect);
-                        if minus.clicked() {
-                            view.zoom_at(view.scale / 1.2, viewport.center(), viewport);
-                        }
-                    });
-                });
+                self.canvas_zoom_bar(ui, dimensions);
             });
     }
 
@@ -5325,12 +5550,12 @@ impl HasturApp {
                                 .map(|(_, p)| {
                                     (
                                         {
-                                            let mut photo = p.photo.clone();
+                                            let mut photo = p.canonical_photo().clone();
                                             photo.release_pixels();
                                             photo
                                         },
                                         p.edit.clone(),
-                                        p.seg.as_ref().map(|s| Arc::new(s.session_copy())),
+                                        p.canonical_seg().map(|s| Arc::new(s.session_copy())),
                                         p.crop_center,
                                     )
                                 })
@@ -5450,6 +5675,9 @@ impl HasturApp {
         if self.preferences_open || self.command_open {
             return;
         }
+        if self.transform_shortcuts(ctx) {
+            return;
+        }
         if self.layer_rename.is_some() {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
                 self.layer_rename = None;
@@ -5480,6 +5708,7 @@ impl HasturApp {
         if ctx.wants_keyboard_input() {
             return;
         }
+        self.brush_size_shortcuts(ctx);
         self.command_shortcuts(ctx);
         self.micro_shortcuts(ctx);
         if self.preferences_open || self.command_open {
@@ -5516,7 +5745,10 @@ impl HasturApp {
         (!self.importing || (self.pending_session.is_none() && !self.photos.is_empty()))
             && self.photos.get(self.current).is_none_or(|p| {
                 self.asset_error == Some(p.id)
-                    || (p.photo.resident && !p.ai_processing && p.revision == p.rendered_revision)
+                    || (p.photo.resident
+                        && p.document_ready()
+                        && !p.ai_processing
+                        && p.revision == p.rendered_revision)
             })
     }
 
@@ -5709,6 +5941,7 @@ impl HasturApp {
         self.frames += 1;
         self.poll(ctx);
         self.ensure_active_asset(ctx);
+        self.ensure_document(ctx);
         if self.startup && !self.splash_preview && self.startup_ready() {
             self.startup = false;
         }
@@ -5716,6 +5949,14 @@ impl HasturApp {
             self.startup_splash(ctx);
             self.capture_screenshot(ctx, self.splash_preview && self.startup_ready());
             return;
+        }
+        let frame_ready = self
+            .photos
+            .get(self.current)
+            .is_some_and(|p| p.photo.resident && p.document_ready());
+        if self.crop_preview && frame_ready {
+            self.crop_preview = false;
+            self.open_crop();
         }
         self.hover_preset = None;
         self.shortcuts(ctx);
@@ -5751,8 +5992,14 @@ impl HasturApp {
         self.tools(ctx);
         self.rename_layer_dialog(ctx);
         self.filmstrip(ctx);
+        self.presets_sidebar(ctx);
         self.ensure_active_asset(ctx);
-        self.canvas(ctx);
+        self.ensure_document(ctx);
+        if self.library_open {
+            self.library_canvas(ctx);
+        } else {
+            self.canvas(ctx);
+        }
         let live_brush = self.canvas_gesture == Gesture::Brush && self.gesture;
         self.schedule_preview(ctx, live_brush);
         self.prepare_requested_ai();
@@ -5796,6 +6043,8 @@ impl HasturApp {
                         ("Ctrl + Z", "Undo"),
                         ("Ctrl + Shift + Z", "Redo"),
                         ("Ctrl + E", "Export"),
+                        ("C / Ctrl + T", "Crop frame"),
+                        ("Enter / Escape", "Apply / cancel frame preview"),
                         ("Ctrl + ,", "Preferences"),
                         ("Ctrl + K", "Find a command"),
                         ("F / F6", "Focus workspace / toggle filmstrip"),
@@ -5846,6 +6095,10 @@ impl HasturApp {
                 && !self.render_busy
                 && self.detail_region_pending.is_none()
                 && !self.patch_feedback.busy()
+                && self
+                    .transform_draft
+                    .as_ref()
+                    .is_none_or(|d| !d.preview_pending)
                 && self.hover_pending.is_none()
                 && self.layer_thumbs_pending.is_none()
                 && self.preset_thumbs.iter().all(Option::is_some)
@@ -5853,7 +6106,7 @@ impl HasturApp {
                 && self
                     .photos
                     .get(self.current)
-                    .is_none_or(|p| p.revision == p.rendered_revision);
+                    .is_none_or(|p| p.document_ready() && p.revision == p.rendered_revision);
             if !settled {
                 self.screenshot_ready_since = None;
             }
@@ -5905,6 +6158,26 @@ impl HasturApp {
 }
 
 fn history_label(before: &Edit, after: &Edit) -> String {
+    if before.transform != after.transform {
+        return if before.transform.crop != after.transform.crop {
+            if let Some(f) = after.transform.crop {
+                format!("Crop frame · {:.1}°", f.angle)
+            } else {
+                "Restore full frame".into()
+            }
+        } else if before.transform.quarter_turns != after.transform.quarter_turns
+            || before.transform.angle != after.transform.angle
+        {
+            format!(
+                "Rotate image · {}°",
+                after.transform.quarter_turns as f32 * 90. + after.transform.angle
+            )
+        } else if let Some([w, h]) = after.transform.size {
+            format!("Resize image · {w} × {h}")
+        } else {
+            "Restore original image size".into()
+        };
+    }
     if before.stack.solo != after.stack.solo {
         return if after.stack.solo.is_some() {
             "Solo layer"
@@ -6076,7 +6349,7 @@ fn theme(ctx: &egui::Context) {
     visuals.window_corner_radius = egui::CornerRadius::same(14);
     ctx.set_visuals(visuals);
     ctx.style_mut(|style| {
-        style.spacing.item_spacing = vec2(6.0, 6.0);
+        style.spacing.item_spacing = vec2(6.0, 4.0);
         style.spacing.button_padding = vec2(12.0, 7.0);
         style.animation_time = 0.18;
         style
@@ -6145,10 +6418,10 @@ fn small_chip(ui: &mut egui::Ui, text: &str, active: bool) -> egui::Response {
     )
 }
 fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    egui::CollapsingHeader::new(RichText::new(title).size(10.0).color(MUTED))
+    egui::CollapsingHeader::new(RichText::new(title).size(12.0).strong().color(TEXT))
         .default_open(true)
         .show_unindented(ui, |ui| {
-            ui.add_space(10.0);
+            ui.add_space(5.0);
             add(ui);
         });
 }
@@ -6305,7 +6578,7 @@ fn slider_control(
         ui.painter()
             .circle_filled(pos2(x, track.center().y), 4.5, accent);
         response.on_hover_text(format!("{tooltip}\nDouble-click the track to reset."));
-        ui.add_space(10.0);
+        ui.add_space(3.0);
     });
 }
 
@@ -6407,7 +6680,7 @@ fn rail_button(
     active: bool,
     tooltip: &str,
 ) -> egui::Response {
-    let (r, response) = ui.allocate_exact_size(vec2(50.0, 46.0), Sense::click());
+    let (r, response) = ui.allocate_exact_size(vec2(44.0, 42.0), Sense::click());
     let painter = ui.painter();
     if active {
         painter.rect_filled(r, 12.0, Color32::from_rgb(48, 42, 18));

@@ -5,6 +5,7 @@ param(
     [string]$VcRedistDirectory,
     [string]$SignTool,
     [string]$CertificateThumbprint,
+    [ValidateSet('Compact','Fast')][string]$CompressionProfile = 'Compact',
     [switch]$SkipBuild
 )
 $ErrorActionPreference = 'Stop'
@@ -106,7 +107,17 @@ try {
     })
     @{schema=1;version=$version;platform='windows-x64';files=$installedFiles} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $payload 'installed-files.json') -Encoding UTF8
     $numericVersion = $version.Replace('-beta.', '.')
-    $compilerArgs = @("/DPayloadRoot=$payload", "/DArtifactsRoot=$artifacts", "/DAppVersion=$version", "/DNumericVersion=$numericVersion", "/DPublisher=$($config.publisher)")
+    # Adjacent source/converted model pairs improve solid compression without
+    # removing either runtime or changing a single byte of installed weights.
+    $modelEntries = @($fileList.files | Where-Object { [IO.Path]::GetExtension($_.destination) -in @('.onnx','.bpk') } | Sort-Object @{Expression={[IO.Path]::GetFileNameWithoutExtension($_.destination)}},@{Expression={if([IO.Path]::GetExtension($_.destination) -eq '.onnx'){0}else{1}}} | ForEach-Object {
+        $destinationDirectory = [IO.Path]::GetDirectoryName($_.destination).Replace('/','\')
+        'Source: "' + (Join-Path $payload $_.destination) + '"; DestDir: "{app}\' + $destinationDirectory + '"; Flags: ignoreversion'
+    })
+    if ($modelEntries.Count -ne 10) { throw 'Review model pairing before changing the bundled model set.' }
+    $modelFilesInclude = Join-Path $buildRoot 'model-files.iss'
+    $modelEntries | Set-Content -LiteralPath $modelFilesInclude -Encoding UTF8
+    $compilerArgs = @("/DPayloadRoot=$payload", "/DArtifactsRoot=$artifacts", "/DAppVersion=$version", "/DNumericVersion=$numericVersion", "/DPublisher=$($config.publisher)", "/DModelFilesInclude=$modelFilesInclude")
+    if ($CompressionProfile -eq 'Fast') { $compilerArgs += '/DFastCompression=1' }
     if ($CertificateThumbprint) {
         $signCommand = '$q' + $SignTool + '$q sign /sha1 ' + $CertificateThumbprint + ' /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $f'
         $compilerArgs += @('/DSignRelease=1', "/Shastur_release=$signCommand")
@@ -119,6 +130,8 @@ try {
     $gitCommit = (& git rev-parse HEAD).Trim()
     $gitDirty = [bool](& git status --porcelain)
     $manifest = @{schema=1;version=$version;releaseDate=$config.releaseDate;platform='windows-x64';publisher=$config.publisher;feedbackEmail=$config.feedbackEmail;gitCommit=$gitCommit;gitDirty=$gitDirty;signingStatus=$signature.Status.ToString();distributionRightsConfirmed=$config.distributionRightsConfirmed;installer=@{file=$setup.Name;bytes=$setup.Length;sha256=(Get-FileHash -LiteralPath $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()};installedFilesManifestSha256=(Get-FileHash -LiteralPath (Join-Path $payload 'installed-files.json') -Algorithm SHA256).Hash.ToLowerInvariant()}
+    $manifest.compressionProfile = $CompressionProfile
+    $manifest.installedBytes = [long](($installedFiles | ForEach-Object { [long]$_.bytes } | Measure-Object -Sum).Sum)
     $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $artifacts 'release-manifest.json') -Encoding UTF8
     "$($manifest.installer.sha256)  $($setup.Name)" | Set-Content -LiteralPath (Join-Path $artifacts 'SHA256SUMS.txt') -Encoding ASCII
     Copy-Item -LiteralPath 'release/Quick-start.html','release/beta-info.txt' -Destination $artifacts

@@ -8,6 +8,9 @@
 #ifndef Publisher
   #define Publisher "Hastur Retouch"
 #endif
+#ifndef ModelFilesInclude
+  #error ModelFilesInclude is required
+#endif
 
 [Setup]
 AppId={{C86EB2BC-1F1C-4485-B78C-14FF3CF7278B}
@@ -35,9 +38,19 @@ VersionInfoProductName=Hastur Retouch
 VersionInfoProductVersion={#NumericVersion}
 VersionInfoProductTextVersion={#AppVersion}
 WizardStyle=modern
+#ifdef FastCompression
 Compression=lzma2/fast
-SolidCompression=yes
 LZMANumBlockThreads=2
+#else
+; A single solid dictionary can reuse unchanged weight bytes across ONNX and
+; Burn packs. Compression uses the separate 64-bit helper; extraction needs
+; roughly 256 MB of dictionary memory and keeps every installed file exact.
+Compression=lzma2/max
+LZMADictionarySize=262144
+LZMAUseSeparateProcess=yes
+LZMANumBlockThreads=1
+#endif
+SolidCompression=yes
 CloseApplications=yes
 RestartApplications=no
 #ifdef SignRelease
@@ -51,7 +64,8 @@ SignedUninstaller=no
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
 
 [Files]
-Source: "{#PayloadRoot}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PayloadRoot}\*"; DestDir: "{app}"; Excludes: "*.onnx,*.bpk"; Flags: ignoreversion recursesubdirs createallsubdirs
+#include ModelFilesInclude
 
 [Icons]
 Name: "{group}\Hastur Retouch Beta"; Filename: "{app}\hastur-retouch.exe"; WorkingDir: "{app}"

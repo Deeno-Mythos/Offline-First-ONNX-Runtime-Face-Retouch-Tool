@@ -62,10 +62,25 @@ pub fn analyze_cached(
     force: bool,
     stage: impl FnMut(Segmentation),
 ) -> Result<Segmentation> {
-    if !force && let Some(seg) = crate::ai_cache::load(image, provider) {
-        return Ok(seg);
+    let cached = if force {
+        None
+    } else {
+        crate::ai_cache::load(image, provider)
+    };
+    if let Some(seg) = cached
+        .as_ref()
+        .filter(|s| s.prepared.contains(PortraitDemand::ALL))
+    {
+        return Ok(seg.clone());
     }
-    let seg = analyze_portrait(image, provider, stage)?;
+    let seg = analyze_portrait_demand_with_status(
+        image,
+        provider,
+        PortraitDemand::ALL,
+        cached.as_ref(),
+        stage,
+        |_| {},
+    )?;
     // A cache write failure must never turn a successfully analyzed photo into an error.
     let _ = crate::ai_cache::save(image, &seg, provider);
     Ok(seg)
@@ -121,15 +136,30 @@ pub fn analyze_shared_demand_cached_with_status(
         None,
         0.05,
     ));
-    if !force && let Some(seg) = crate::ai_cache::load_shared(image, provider) {
+    let cached = if force {
+        None
+    } else {
+        crate::ai_cache::load_shared(image, provider)
+    };
+    if let Some(seg) = cached.as_ref().filter(|s| s.prepared.contains(demand)) {
         status(AiStatus::new(
             "Cached portrait ready",
             &seg.status,
             None,
             1.0,
         ));
-        return Ok(seg);
+        return Ok(seg.clone());
     }
+    // Prefer an existing richer photo-owned state, especially explicit masks.
+    // Otherwise a partial disk result seeds only the missing neural stages.
+    let base = base
+        .filter(|b| {
+            b.custom_skin
+                || cached
+                    .as_ref()
+                    .is_none_or(|c| !c.prepared.contains(b.prepared))
+        })
+        .or(cached.as_ref());
     let seg = analyze_portrait_demand_with_status(
         image,
         provider,
@@ -138,7 +168,8 @@ pub fn analyze_shared_demand_cached_with_status(
         stage,
         &mut status,
     )?;
-    if seg.prepared.contains(PortraitDemand::ALL)
+    if seg.prepared.geometry
+        && !seg.custom_skin
         && crate::ai_cache::save(image, &seg, provider).is_ok()
     {
         crate::ai_cache::associate(image, &seg, provider);

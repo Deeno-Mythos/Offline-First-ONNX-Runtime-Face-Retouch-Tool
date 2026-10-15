@@ -49,6 +49,7 @@ enum Blocker {
     Masked,
     Group(LayerKind),
     HealingDisabled,
+    AdjustmentDisabled(Adjustment),
     Strength,
 }
 impl Blocker {
@@ -61,6 +62,7 @@ impl Blocker {
             Self::Masked => "The layer mask hides this entire layer.",
             Self::Group(_) => "This tool is disabled in the saved layer settings.",
             Self::HealingDisabled => "Healing is disabled in this layer.",
+            Self::AdjustmentDisabled(_) => "This tool's adjustment is disabled or set to zero.",
             Self::Strength => "Brush strength is 0%.",
         }
     }
@@ -70,7 +72,7 @@ impl Blocker {
             Self::Hidden => "Show layer",
             Self::Transparent => "Set opacity to 100%",
             Self::Masked => "Reveal layer mask",
-            Self::Group(_) | Self::HealingDisabled => "Enable tool",
+            Self::Group(_) | Self::HealingDisabled | Self::AdjustmentDisabled(_) => "Enable tool",
             Self::Strength => "Set strength to 100%",
         }
     }
@@ -78,7 +80,14 @@ impl Blocker {
 pub(super) fn is_manual(target: Target) -> bool {
     matches!(
         target,
-        Target::Liquify | Target::Heal | Target::Clone | Target::Patch
+        Target::Liquify
+            | Target::Heal
+            | Target::Clone
+            | Target::Patch
+            | Target::Clothing
+            | Target::Dodge
+            | Target::Burn
+            | Target::StrayHair
     )
 }
 impl HasturApp {
@@ -122,18 +131,30 @@ impl HasturApp {
         let kind = match target {
             Target::Liquify => LayerKind::Liquify,
             Target::Heal => LayerKind::SpotHeal,
+            Target::StrayHair => LayerKind::SpotHeal,
             Target::Clone => LayerKind::CloneStamp,
             Target::Patch => LayerKind::Patch,
+            Target::Clothing => LayerKind::Portrait,
+            Target::Dodge | Target::Burn => LayerKind::Color,
             _ => unreachable!(),
         };
         if edit.layers.get(kind).factor() == 0. {
             return Some(Blocker::Group(kind));
         }
-        if target == Target::Heal && edit.settings.effective().healing <= 0. {
+        if matches!(target, Target::Heal | Target::StrayHair)
+            && edit.settings.effective().healing <= 0.
+        {
             return Some(Blocker::HealingDisabled);
         }
         if self.brush_strength <= 0. {
             return Some(Blocker::Strength);
+        }
+        let settings = edit.settings.effective();
+        if target == Target::Clothing && settings.clothing_wrinkles <= 0. {
+            return Some(Blocker::AdjustmentDisabled(Adjustment::ClothingWrinkles));
+        }
+        if matches!(target, Target::Dodge | Target::Burn) && settings.dodge_burn <= 0. {
+            return Some(Blocker::AdjustmentDisabled(Adjustment::DodgeBurn));
         }
         None
     }
@@ -182,6 +203,14 @@ impl HasturApp {
                     .retain(|a| *a != Adjustment::Healing);
                 photo.edit.settings.healing = 100.;
             }
+            Blocker::AdjustmentDisabled(adjustment) => {
+                photo.edit.settings.disabled.retain(|a| *a != adjustment);
+                match adjustment {
+                    Adjustment::ClothingWrinkles => photo.edit.settings.clothing_wrinkles = 100.,
+                    Adjustment::DodgeBurn => photo.edit.settings.dodge_burn = 0.75,
+                    _ => unreachable!(),
+                }
+            }
             Blocker::Strength => self.brush_strength = 100.,
         }
         if photo.edit != before {
@@ -213,6 +242,10 @@ impl HasturApp {
             let text = match target {
                 Target::Liquify => "Liquify · drag to push/pull",
                 Target::Heal => "Spot heal · click or drag over a defect",
+                Target::StrayHair => "Stray hair · trace individual strands with a small brush",
+                Target::Clothing => "Clothing · paint creases, preserving weave; avoid seams",
+                Target::Dodge => "Dodge · paint to brighten · −/+ changes size",
+                Target::Burn => "Burn · paint to deepen light · −/+ changes size",
                 Target::Clone if self.clone_pick_source => "Clone · click a clean source area",
                 Target::Clone
                     if !self
@@ -239,12 +272,26 @@ impl HasturApp {
                 150.
             } else {
                 0.
+            } + if matches!(
+                target,
+                Target::Clothing | Target::StrayHair | Target::Dodge | Target::Burn
+            ) {
+                110.
+            } else {
+                0.
             };
             ui.add_sized(
                 vec2((ui.available_width() - reserve).max(70.), 34.),
                 egui::Label::new(RichText::new(text).size(11.).color(YELLOW)).truncate(),
             )
             .on_hover_text(text);
+            if matches!(
+                target,
+                Target::Clothing | Target::StrayHair | Target::Dodge | Target::Burn
+            ) {
+                let erase = ui.checkbox(&mut self.erase, "Erase repair");
+                hit(ui, "erase-painted-repair", erase.rect);
+            }
             if matches!(target, Target::Heal | Target::Clone) {
                 let p = &mut self.photos[self.current];
                 let before = p.edit.clone();
@@ -352,6 +399,7 @@ impl HasturApp {
         let a = mapping.source(start);
         let b = mapping.source(end);
         Some(crate::cleanup::PatchStroke {
+            feather: Some(self.brush_radius),
             boundary: self
                 .patch_draft
                 .boundary

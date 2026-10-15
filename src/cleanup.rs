@@ -20,6 +20,10 @@ pub struct PatchStroke {
     pub boundary: Vec<[f32; 2]>,
     /// Translation from each destination pixel to its source texture, in UV units.
     pub offset: [f32; 2],
+    /// Optional feather width relative to the source's short edge. Older patches
+    /// retain selection-relative feathering when this field is absent.
+    #[serde(default)]
+    pub feather: Option<f32>,
     pub softness: f32,
     pub strength: f32,
 }
@@ -492,7 +496,7 @@ fn prepare_patch(source: &RgbaImage, patch: &PatchStroke) -> Option<PreparedPatc
             width: max_x - min_x,
             height: max_y - min_y,
         },
-        feather: (right - left).min(bottom - top).max(1.0) * 0.25 * patch.softness.clamp(0.0, 1.0),
+        feather: patch_feather(patch, (w, h), (right - left).min(bottom - top)),
         strength: patch.strength / 100.0,
     })
 }
@@ -850,7 +854,7 @@ fn apply_patch(
         .map(|p| p[1])
         .fold(f32::NEG_INFINITY, f32::max)
         - boundary.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
-    let feather = bounds_width.min(bounds_height).max(1.0) * 0.25 * patch.softness.clamp(0.0, 1.0);
+    let feather = patch_feather(patch, (w, h), bounds_width.min(bounds_height));
     let strength = patch.strength / 100.0;
     for y in min_y..max_y {
         for x in min_x..max_x {
@@ -889,6 +893,16 @@ fn apply_patch(
             }
         }
     }
+}
+
+fn patch_feather(patch: &PatchStroke, dimensions: (u32, u32), selection_short: f32) -> f32 {
+    let width = patch
+        .feather
+        .filter(|v| v.is_finite())
+        .map_or(selection_short.max(1.) * 0.25, |v| {
+            v.clamp(0., 0.15) * dimensions.0.min(dimensions.1) as f32
+        });
+    width * patch.softness.clamp(0., 1.)
 }
 
 fn inside_polygon(point: [f32; 2], boundary: &[[f32; 2]]) -> bool {
@@ -955,6 +969,16 @@ fn stamp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_patch_feather_is_preserved_and_explicit_width_scales_in_native_pixels() {
+        let mut patch: PatchStroke =
+            ron::from_str("(boundary:[],offset:(0.,0.),softness:0.8,strength:100.)").unwrap();
+        assert_eq!(patch.feather, None);
+        assert_eq!(patch_feather(&patch, (1000, 2000), 40.), 8.);
+        patch.feather = Some(0.02);
+        assert_eq!(patch_feather(&patch, (1000, 2000), 40.), 16.);
+        assert_eq!(patch_feather(&patch, (500, 1000), 20.), 8.);
+    }
 
     #[test]
     fn patch_matches_a_changing_light_gradient_without_blurring_donor_texture() {
@@ -983,6 +1007,7 @@ mod tests {
         }
         let mut edit = Edit::default();
         edit.patches.push(PatchStroke {
+            feather: None,
             boundary: vec![[0.25, 0.25], [0.5, 0.25], [0.5, 0.5], [0.25, 0.5]],
             offset: [0.25, 0.],
             softness: 0.,
@@ -1013,6 +1038,7 @@ mod tests {
         });
         let mut edit = Edit::default();
         edit.patches.push(PatchStroke {
+            feather: None,
             boundary: vec![[0.125, 0.125], [0.25, 0.125], [0.25, 0.25], [0.125, 0.25]],
             offset: [0., 0.],
             softness: 0.,
@@ -1157,6 +1183,7 @@ mod tests {
             strength: 100.0,
         });
         edit.patches.push(PatchStroke {
+            feather: None,
             boundary: vec![[0.15, 0.18], [0.43, 0.2], [0.34, 0.47], [0.17, 0.41]],
             offset: [0.47, 0.42],
             softness: 0.81,
@@ -1326,6 +1353,7 @@ mod tests {
         }
         let mut edit = Edit::default();
         edit.patches.push(PatchStroke {
+            feather: None,
             boundary: vec![[0.25, 0.25], [0.45, 0.25], [0.45, 0.45], [0.25, 0.45]],
             offset: [0.35, 0.0],
             softness: 0.0,

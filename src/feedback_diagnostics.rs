@@ -167,7 +167,16 @@ pub fn profile(path: &std::path::Path, output: &std::path::Path, baseline: bool)
         ("90", Some(0.9)),
         ("100", Some(1.0)),
     ] {
-        for target in [Target::Liquify, Target::Heal, Target::Clone, Target::Patch] {
+        for target in [
+            Target::Liquify,
+            Target::Heal,
+            Target::Clone,
+            Target::Patch,
+            Target::Clothing,
+            Target::Dodge,
+            Target::Burn,
+            Target::StrayHair,
+        ] {
             let p = &mut studio.app.photos[0];
             p.edit = Edit::default();
             p.edit.ensure_stack();

@@ -38,6 +38,7 @@ fn append(edit: &mut Edit, tool: &str, index: usize) {
         }),
         "patch" => {
             let patch = PatchStroke {
+                feather: None,
                 boundary: vec![[0.49, 0.41], [0.51, 0.41], [0.51, 0.44], [0.49, 0.44]],
                 offset: [-0.045 + index as f32 * 0.001, 0.035],
                 softness: 0.7,

@@ -26,18 +26,10 @@ impl View {
             self.scale = (viewport.width() * dpi / dimensions.x)
                 .min(viewport.height() * dpi / dimensions.y)
                 * 0.96;
-            self.pan = [0.0; 2];
         }
         let size = dimensions * self.scale / dpi;
-        for (axis, limit) in [
-            ((size.x - viewport.width()) * 0.5).max(0.0),
-            ((size.y - viewport.height()) * 0.5).max(0.0),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            self.pan[axis] = self.pan[axis].clamp(-limit, limit);
-        }
+        // A studio canvas has room beyond its document at every zoom, including Fit.
+        // Explicit Fit resets the camera; layout must never undo a user's drag.
         let rect = Rect::from_center_size(viewport.center() + vec2(self.pan[0], self.pan[1]), size);
         if (self.scale - self.scale.round()).abs() < 0.0001 {
             // A native-pixel view must also start on a physical pixel boundary.
@@ -66,6 +58,22 @@ pub enum Gesture {
     Divider,
     Brush,
     Source,
+}
+
+/// Preserve the pointer grab position, including sub-threshold and release events.
+#[derive(Clone, Copy, Debug)]
+pub struct PanDrag {
+    origin: Pos2,
+    pan: [f32; 2],
+}
+impl PanDrag {
+    pub fn new(origin: Pos2, pan: [f32; 2]) -> Self {
+        Self { origin, pan }
+    }
+    pub fn position(self, pointer: Pos2) -> [f32; 2] {
+        let delta = pointer - self.origin;
+        [self.pan[0] + delta.x, self.pan[1] + delta.y]
+    }
 }
 pub fn gesture_at(pos: Pos2, image: Rect, split: Option<f32>, brush: bool, space: bool) -> Gesture {
     if split.is_some_and(|s| {
@@ -139,7 +147,7 @@ pub fn select(
 mod tests {
     use super::*;
     #[test]
-    fn native_pixels_and_anchor_and_bounds() {
+    fn native_pixels_and_anchor_and_unrestricted_pan() {
         let viewport = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
         let dimensions = vec2(4000.0, 3000.0);
         let mut v = View::default();
@@ -158,9 +166,34 @@ mod tests {
         assert!((after.min.x * 1.25).fract().abs() < 0.001);
         v.pan = [100_000.0; 2];
         v.layout(viewport, dimensions, 1.25);
-        assert_eq!(v.pan, [1200.0, 900.0]);
+        assert_eq!(v.pan, [100_000.0; 2]);
         v.zoom_at(999.0, anchor, viewport);
         assert_eq!(v.scale, View::MAX);
+    }
+    #[test]
+    fn small_and_fitted_documents_have_unrestricted_surrounding_canvas() {
+        let viewport = Rect::from_min_size(Pos2::ZERO, vec2(800., 600.));
+        for dpi in [1., 1.25, 2.] {
+            for scale in [0.1, 0.62, 0.9, 1., 2.] {
+                for fit in [true, false] {
+                    let mut view = View {
+                        scale,
+                        fit,
+                        pan: [420., -360.],
+                    };
+                    let image = view.layout(viewport, vec2(420., 640.), dpi);
+                    assert_eq!(view.pan, [420., -360.]);
+                    assert!(
+                        image
+                            .center()
+                            .distance(viewport.center() + vec2(420., -360.))
+                            <= 0.72
+                    );
+                    let again = view.layout(viewport, vec2(420., 640.), dpi);
+                    assert_eq!(image, again, "Layout snapped the camera back");
+                }
+            }
+        }
     }
     #[test]
     fn divider_wins_even_with_brush_or_space() {

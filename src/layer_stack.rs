@@ -136,6 +136,7 @@ impl Edit {
     pub fn flat_edit(&self) -> Self {
         let mut flat = self.clone();
         flat.stack = LayerStack::default();
+        flat.transform = Default::default();
         flat
     }
     pub fn ensure_stack(&mut self) {
@@ -196,7 +197,9 @@ impl Edit {
             .map_or_else(Edit::default, |layer| layer.edit.flat_edit());
         let mut stack = self.stack.clone();
         stack.active = id;
+        let transform = self.transform;
         *self = flat;
+        self.transform = transform;
         self.stack = stack;
         true
     }
@@ -265,7 +268,9 @@ impl Edit {
             let mut stack = self.stack.clone();
             stack.layers.clear();
             stack.active = 0;
+            let transform = self.transform;
             *self = flat;
+            self.transform = transform;
             self.stack = stack;
         } else {
             self.stack.layers.remove(index);

@@ -57,6 +57,7 @@ fn tool_edit(target: Target, center: [f32; 2]) -> Edit {
             strength: 100.,
         }),
         Target::Patch => edit.patches.push(PatchStroke {
+            feather: None,
             boundary: vec![
                 [center[0] - 0.014, center[1] - 0.014],
                 [center[0] + 0.014, center[1] - 0.014],

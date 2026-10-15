@@ -17,9 +17,16 @@ fn decode_srgb(v: vec3<f32>) -> vec3<f32> {
 }
 @fragment fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
     let uv = uniforms.uv_rect.xy + v.uv * uniforms.uv_rect.zw;
-    let before = textureSample(original, sampler_linear, uv);
-    let after = textureSample(edited, sampler_linear, uv);
-    let pixel = select(after, before, uv.x < uniforms.split);
+    var pixel: vec4<f32>;
+    if uniforms.split <= 0. {
+        pixel = textureSample(edited, sampler_linear, uv);
+    } else if uniforms.split >= 1. {
+        pixel = textureSample(original, sampler_linear, uv);
+    } else {
+        let before = textureSample(original, sampler_linear, uv);
+        let after = textureSample(edited, sampler_linear, uv);
+        pixel = select(after, before, uv.x < uniforms.split);
+    }
     let checker = 0.12 + f32((u32(v.position.x / 12.) + u32(v.position.y / 12.)) % 2u) * 0.035;
     let display = encode_srgb(pixel.rgb) * pixel.a + vec3(checker) * (1. - pixel.a);
     return vec4(select(display, decode_srgb(display), uniforms.srgb_target > 0.5), 1.);

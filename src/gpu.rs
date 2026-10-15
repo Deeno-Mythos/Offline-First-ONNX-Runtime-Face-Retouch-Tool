@@ -30,6 +30,8 @@ struct Resources {
     edited: Option<WorkingImage>,
     bind: Option<wgpu::BindGroup>,
     uniform_value: Option<[f32; 8]>,
+    photo: Option<u64>,
+    upload_pixels: [u64; 2],
 }
 
 pub fn install(cc: &eframe::CreationContext<'_>) -> bool {
@@ -144,6 +146,8 @@ fn canvas_resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Resou
         edited: None,
         bind: None,
         uniform_value: None,
+        photo: None,
+        upload_pixels: [0; 2],
     }
 }
 
@@ -230,6 +234,8 @@ pub fn release_images(state: &egui_wgpu::RenderState) {
         resources.original = None;
         resources.edited = None;
         resources.uniform_value = None;
+        resources.photo = None;
+        resources.upload_pixels = [0; 2];
     }
 }
 fn upload(
@@ -392,27 +398,70 @@ impl CallbackTrait for Canvas {
         let Some(resources) = callback_resources.get_mut::<Resources>() else {
             return vec![];
         };
-        let old_original = resources.original.take();
-        let old_edited = resources.edited.take();
-        let (original, changed_original, _) = upload(
-            device,
-            queue,
-            encoder,
-            &resources.upload,
-            &self.original,
-            old_original,
-            true,
-        );
-        let (edited, changed_edited, _) = upload(
-            device,
-            queue,
-            encoder,
-            &resources.upload,
-            &self.edited,
-            old_edited,
-            true,
-        );
-        if changed_original || changed_edited || resources.bind.is_none() {
+        let split = if self.show_original {
+            1.1
+        } else if self.split.is_finite() {
+            self.split
+        } else {
+            0.
+        };
+        let before_visible = split > 0.;
+        let after_visible = split < 1.;
+        if resources.photo != Some(self.key.0) {
+            // Do not pin a hidden texture from the previous document. Keep a
+            // visible allocation available for same-size uploads on photo switches.
+            if !before_visible {
+                resources.original = None;
+            }
+            if !after_visible {
+                resources.edited = None;
+            }
+            resources.bind = None;
+            resources.photo = Some(self.key.0);
+        }
+        resources.upload_pixels = [0; 2];
+        let mut changed = false;
+        if before_visible {
+            let (image, allocated, pixels) = upload(
+                device,
+                queue,
+                encoder,
+                &resources.upload,
+                &self.original,
+                resources.original.take(),
+                true,
+            );
+            resources.original = Some(image);
+            resources.upload_pixels[0] = pixels;
+            changed |= allocated;
+        }
+        if after_visible {
+            let (image, allocated, pixels) = upload(
+                device,
+                queue,
+                encoder,
+                &resources.upload,
+                &self.edited,
+                resources.edited.take(),
+                true,
+            );
+            resources.edited = Some(image);
+            resources.upload_pixels[1] = pixels;
+            changed |= allocated;
+        }
+        if changed || resources.bind.is_none() {
+            // An unused shader slot may share the visible texture until the
+            // user first requests comparison or holds the original shortcut.
+            let original = resources
+                .original
+                .as_ref()
+                .or(resources.edited.as_ref())
+                .unwrap();
+            let edited = resources
+                .edited
+                .as_ref()
+                .or(resources.original.as_ref())
+                .unwrap();
             resources.bind = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Hastur before/after image pair"),
                 layout: &resources.texture_layout,
@@ -440,11 +489,9 @@ impl CallbackTrait for Canvas {
                 ],
             }));
         }
-        resources.original = Some(original);
-        resources.edited = Some(edited);
         let uv = canvas_uv(self.image_rect, self.paint_rect, screen);
         let uniform = [
-            if self.show_original { 1.1 } else { self.split },
+            split,
             if resources.format.is_srgb() { 1.0 } else { 0.0 },
             0.0,
             0.0,
@@ -514,6 +561,109 @@ pub fn linear_half_pixels(image: &RgbaImage) -> Vec<half::f16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a GPU; run separately from timing diagnostics"]
+    fn hidden_comparison_uploads_are_deferred_without_stale_pixels_on_switches() {
+        let ctx = egui::Context::default();
+        let mut profiler = diagnostics::FrameProfiler::new([160, 120]).unwrap();
+        let image = |size: (u32, u32), color| {
+            Arc::new(RgbaImage::from_pixel(size.0, size.1, image::Rgba(color)))
+        };
+        let mut canvas = Canvas {
+            key: (1, 1),
+            image_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(160., 120.)),
+            paint_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(160., 120.)),
+            original: image((16, 12), [210, 70, 40, 255]),
+            edited: image((16, 12), [20, 80, 140, 255]),
+            split: 0.,
+            show_original: false,
+        };
+        let mut frame = |canvas: &Canvas, expected_uploads: [u64; 2], colors: [[u8; 3]; 2]| {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(canvas.paint_rect),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.layer_painter(egui::LayerId::background()).add(
+                        egui_wgpu::Callback::new_paint_callback(
+                            canvas.paint_rect,
+                            Canvas {
+                                original: canvas.original.clone(),
+                                edited: canvas.edited.clone(),
+                                ..*canvas
+                            },
+                        ),
+                    );
+                },
+            );
+            profiler.frame(&ctx, output).unwrap();
+            assert_eq!(profiler.canvas_upload_pixels(), expected_uploads);
+            let pixels = profiler.screenshot().unwrap();
+            for (x, color) in [40, 120].into_iter().zip(colors) {
+                for (c, value) in color.into_iter().enumerate() {
+                    assert!(
+                        pixels[(x, 60)][c].abs_diff(value) <= 1,
+                        "pixel {:?}, expected {color:?}, split {} held {}",
+                        pixels[(x, 60)],
+                        canvas.split,
+                        canvas.show_original
+                    );
+                }
+            }
+        };
+        let mut before = [210, 70, 40];
+        let mut after = [20, 80, 140];
+        frame(&canvas, [0, 192], [after, after]);
+        frame(&canvas, [0, 0], [after, after]);
+        canvas.split = 0.5;
+        frame(&canvas, [192, 0], [before, after]);
+        before = [80, 170, 90];
+        canvas.original = image((16, 12), [80, 170, 90, 255]);
+        canvas.split = 0.;
+        frame(&canvas, [0, 0], [after, after]);
+        canvas.show_original = true;
+        frame(&canvas, [192, 0], [before, before]);
+        after = [140, 30, 70];
+        canvas.edited = image((16, 12), [140, 30, 70, 255]);
+        frame(&canvas, [0, 0], [before, before]);
+        canvas.show_original = false;
+        canvas.split = 0.5;
+        frame(&canvas, [0, 192], [before, after]);
+        canvas.original = image((11, 9), [80, 170, 90, 255]);
+        canvas.edited = image((11, 9), [140, 30, 70, 255]);
+        canvas.split = 0.;
+        frame(&canvas, [0, 99], [after, after]);
+        canvas.show_original = true;
+        frame(&canvas, [99, 0], [before, before]);
+        canvas.show_original = false;
+        canvas.split = 0.5;
+        frame(&canvas, [0, 0], [before, after]);
+        canvas.key = (2, 1);
+        before = [40, 140, 180];
+        after = [200, 130, 10];
+        canvas.original = image((11, 9), [40, 140, 180, 255]);
+        canvas.edited = image((11, 9), [200, 130, 10, 255]);
+        canvas.show_original = true;
+        frame(&canvas, [99, 0], [before, before]);
+        canvas.show_original = false;
+        canvas.split = 0.;
+        frame(&canvas, [0, 99], [after, after]);
+        canvas.split = 0.5;
+        frame(&canvas, [0, 0], [before, after]);
+        canvas.key = (3, 1);
+        before = [120, 50, 20];
+        after = [90, 120, 170];
+        canvas.original = image((11, 9), [120, 50, 20, 255]);
+        canvas.edited = image((11, 9), [90, 120, 170, 255]);
+        canvas.split = f32::NAN;
+        frame(&canvas, [0, 99], [after, after]);
+        canvas.split = 1.2;
+        frame(&canvas, [99, 0], [before, before]);
+        canvas.split = -0.1;
+        frame(&canvas, [0, 0], [after, after]);
+    }
 
     #[test]
     fn clipped_zoom_keeps_equal_source_pixel_scale_on_both_axes_and_at_each_dpi() {

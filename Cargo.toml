@@ -24,6 +24,7 @@ bytemuck = { version = "1", features = ["derive"] }
 anyhow = "1"
 kamadak-exif = "0.6"
 half = { version = "2", features = ["bytemuck"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 moxcms = "0.8"
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["std", "ndarray", "load-dynamic", "directml", "cuda", "coreml", "api-24"] }
 ndarray = { version = "0.17", optional = true }

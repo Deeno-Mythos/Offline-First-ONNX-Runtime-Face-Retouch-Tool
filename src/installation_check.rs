@@ -87,6 +87,78 @@ fn check(output: &Path, provider: Provider, report: &mut String) -> Result<()> {
         start.elapsed().as_secs_f64(),
         seg.status
     ));
+    let transform = crate::image_transform::ImageTransform {
+        size: Some([photo.dimensions().0 / 2, photo.dimensions().1 / 2]),
+        crop: Some(crate::image_transform::CropFrame {
+            center: [0.5; 2],
+            extent: [0.65, 0.7],
+            angle: 17.,
+        }),
+        ..Default::default()
+    };
+    let working = photo.transformed(transform, None)?;
+    let edit = Edit {
+        transform,
+        settings: engine::Settings {
+            under_eyes: 40.,
+            smoothing: 30.,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let aligned = seg.transformed(transform, photo.dimensions());
+    let expected = engine::render(&working.original, &edit, Some(&aligned));
+    let export = engine::export(
+        &photo,
+        &edit,
+        Some(&seg),
+        &output.join("geometry"),
+        ExportSize::Original,
+        true,
+        100,
+    )?;
+    ensure!(
+        *engine::load_photo(&export)?.original == expected,
+        "Resize/crop export does not match the working document with AI maps"
+    );
+    ensure!(
+        photo.transformed(Default::default(), None)?.original == photo.original,
+        "Reset image geometry altered the source"
+    );
+    report.push_str("Resize/crop: frame-only rotation, AI map alignment, document dimensions, lossless export and source preservation passed.\n");
+
+    let (w, h) = photo.dimensions();
+    let translated = crate::image_transform::ImageTransform {
+        crop: Some(crate::image_transform::CropFrame {
+            center: [0.5 - 10. / w as f32, 0.5 - 7. / h as f32],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let moved = photo.transformed(translated, None)?;
+    ensure!(
+        moved.dimensions() == (w, h)
+            && moved.original.get_pixel(0, 0).0 == [0; 4]
+            && moved.original.get_pixel(10, 7) == photo.original.get_pixel(0, 0),
+        "Moving the full crop frame changed its size, lost transparency or resampled the photo"
+    );
+    let export = engine::export(
+        &photo,
+        &Edit {
+            transform: translated,
+            ..Default::default()
+        },
+        None,
+        &output.join("frame-movement"),
+        ExportSize::Original,
+        true,
+        100,
+    )?;
+    ensure!(
+        *engine::load_photo(&export)?.original == *moved.original,
+        "Moved crop export differs from the workspace"
+    );
+    report.push_str("Frame movement: full-size X/Y translation, transparent margins, stable dimensions, native pixels and PNG export passed.\n");
 
     crate::ai_cache::save(&photo.preview, &seg, provider)?;
     ensure!(
@@ -98,8 +170,25 @@ fn check(output: &Path, provider: Provider, report: &mut String) -> Result<()> {
         crate::ai_cache::directory().display()
     ));
 
-    for tool in [Target::Liquify, Target::Heal, Target::Clone, Target::Patch] {
+    let focus = crate::focus::analyze(original, &seg.faces);
+    ensure!(focus.score.is_some(), "Detected face has no focus score");
+    report.push_str(&format!("Face focus: {}\n", focus.summary()));
+    for tool in [
+        Target::Liquify,
+        Target::Heal,
+        Target::Clone,
+        Target::Patch,
+        Target::Clothing,
+        Target::Dodge,
+        Target::Burn,
+        Target::StrayHair,
+    ] {
         let mut edit = Edit::default();
+        let center = match tool {
+            Target::Clothing => [0.35, 0.8],
+            Target::StrayHair => [0.11, 0.47],
+            _ => [0.58, 0.44],
+        };
         match tool {
             Target::Liquify => edit.warps.push(WarpStroke {
                 center: [0.55, 0.43],
@@ -124,11 +213,22 @@ fn check(output: &Path, provider: Provider, report: &mut String) -> Result<()> {
                 strength: 100.,
             }),
             Target::Patch => edit.patches.push(PatchStroke {
+                feather: None,
                 boundary: vec![[0.56, 0.42], [0.60, 0.42], [0.60, 0.46], [0.56, 0.46]],
                 offset: [-0.035, 0.015],
                 softness: 0.75,
                 strength: 100.,
             }),
+            Target::Clothing | Target::Dodge | Target::Burn | Target::StrayHair => {
+                edit.strokes.push(Stroke {
+                    target: tool,
+                    center,
+                    radius: 0.07,
+                    softness: 0.7,
+                    strength: 100.,
+                    erase: false,
+                })
+            }
             _ => unreachable!(),
         }
         edit.ensure_stack();
@@ -169,7 +269,7 @@ fn check(output: &Path, provider: Provider, report: &mut String) -> Result<()> {
             .unwrap()
             .strokes
             .push(MaskStroke {
-                center: [0.58, 0.44],
+                center,
                 radius: 0.15,
                 softness: 0.5,
                 strength: 100.,
